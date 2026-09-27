@@ -1,0 +1,42 @@
+name: Import pinned Radix upstream
+on:
+  push:
+    branches: [main]
+    paths: [.github/workflows/import-radix.yml]
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  import:
+    if: github.repository == 'kamatbot/DiskOdds'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Import once, preserving license and upstream history
+        shell: bash
+        run: |
+          set -euo pipefail
+          if test -f Radix/RadixApp.swift; then
+            echo 'Radix already imported; refusing to overwrite working code.'
+            exit 0
+          fi
+          original=$(git rev-parse HEAD)
+          upstream=14a76df4fe626dcdefc4f2abbc868dff4bbbd6e4
+          cp .github/workflows/import-radix.yml /tmp/import-radix.yml
+          cp DISKODDS-UPSTREAM.md /tmp/diskodds-upstream.md
+          git fetch https://github.com/colinvkim/Radix.git "$upstream"
+          git read-tree --reset -u "$upstream"
+          mkdir -p .github/workflows
+          cp /tmp/import-radix.yml .github/workflows/import-radix.yml
+          cp /tmp/diskodds-upstream.md DISKODDS-UPSTREAM.md
+          git add .github/workflows/import-radix.yml DISKODDS-UPSTREAM.md
+          test -s LICENSE
+          git config user.name 'DiskOdds'
+          git config user.email '289325931+kamatbot@users.noreply.github.com'
+          tree=$(git write-tree)
+          commit=$(printf 'chore: import Radix at %s with original source, assets, tests and history\n' "$upstream" | git commit-tree "$tree" -p "$original" -p "$upstream")
+          git update-ref refs/heads/main "$commit" "$original"
+          git push origin main
+          echo "Imported Radix into commit $commit" >> "$GITHUB_STEP_SUMMARY"
