@@ -1,0 +1,35 @@
+name: Repair localized accessor collisions
+on:
+  push:
+    branches: [feat/vibecoder-cleanup]
+    paths: [.github/workflows/repair-catalog.yml]
+permissions:
+  contents: write
+jobs:
+  repair:
+    if: github.repository == 'kamatbot/DiskOdds'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: feat/vibecoder-cleanup
+      - name: Disable unused generated accessors for the three conflicting keys
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import json
+          path = Path('Radix/Localizable.xcstrings')
+          catalog = json.loads(path.read_text())
+          for key in ['%lld%%', 'Workspace', 'WORKSPACE']:
+              assert key in catalog['strings'], key
+              catalog['strings'][key]['generatesSymbol'] = False
+          path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2) + '\n')
+          PY
+          git config user.name DiskOdds
+          git config user.email 289325931+kamatbot@users.noreply.github.com
+          git add Radix/Localizable.xcstrings
+          if ! git diff --cached --quiet; then
+            git commit -m 'fix: disable only conflicting localization accessors, retaining all translations'
+            git push origin HEAD:feat/vibecoder-cleanup
+          fi
