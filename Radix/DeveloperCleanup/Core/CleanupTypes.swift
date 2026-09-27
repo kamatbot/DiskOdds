@@ -109,7 +109,12 @@ nonisolated enum CleanupPolicy {
         "Library/Caches/Homebrew", "Library/Caches/CocoaPods", "Library/Caches/pip",
         "Library/Caches/uv", "Library/Caches/org.swift.swiftpm", ".npm/_cacache"
     ]
-    static let projectPaths = [".next/cache", ".turbo", ".parcel-cache", "node_modules/.cache"]
+    static let projectPaths = [
+        ".next/cache", ".turbo", ".parcel-cache", "node_modules/.cache",
+        ".build/xcode-derived-data/Build", ".build/xcode-derived-data/Index.noindex",
+        ".derivedData/Build", ".derivedData/Index.noindex",
+        "DerivedData/Build", "DerivedData/Index.noindex"
+    ]
     static let derivedPaths = ["Build", "Index.noindex"]
     static let xcodeCaches = ["ModuleCache.noindex", "CompilationCache.noindex", "SDKStatCaches.noindex"]
 

@@ -57,7 +57,6 @@ nonisolated struct CleanupScanner: Sendable {
                     impact: "Packages may need downloading again. Offline builds can fail; custom changes inside a cache are not guaranteed recoverable.",
                     recovery: "Restore from Trash before emptying it, or let the package manager download again.")
         }
-        // Project discovery is opt-in. Never traverse repository Git metadata.
         for root in context.projectRoots {
             var stack: [(URL, Int)] = [(root, 0)]
             var visited = 0
@@ -67,7 +66,11 @@ nonisolated struct CleanupScanner: Sendable {
                 if visited > 5_000 { report.warnings.append("Project discovery capped at 5,000 folders in \(root.path)."); break }
                 let values = try? directory.resourceValues(forKeys: [.isSymbolicLinkKey, .isDirectoryKey])
                 guard values?.isDirectory == true, values?.isSymbolicLink != true else { continue }
-                if FileManager.default.fileExists(atPath: directory.appendingPathComponent("package.json").path) {
+                let entries = children(directory)
+                let isProject = ["package.json", "Package.swift"].contains {
+                    FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+                } || entries.contains { ["xcodeproj", "xcworkspace"].contains($0.pathExtension) }
+                if isProject {
                     for suffix in CleanupPolicy.projectPaths {
                         let target = directory.appendingPathComponent(suffix)
                         guard FileManager.default.fileExists(atPath: target.path) else { continue }
@@ -75,13 +78,14 @@ nonisolated struct CleanupScanner: Sendable {
                         do { try commands.verifyProjectCache(path: target.path, project: directory.path) }
                         catch { blocker = error.localizedDescription }
                         try add(target, title: "\(directory.lastPathComponent) / \(suffix)", kind: .projectCache,
-                                impact: "Removes framework-generated cache only. The next dev server or build may start more slowly.",
+                                impact: "Removes a known generated cache/build subdirectory only, never SourcePackages or SwiftPM checkouts. The next build may take longer.",
                                 recovery: "Restore from Trash or rerun your usual build command.", project: directory.path, blocker: blocker)
                     }
                 }
                 if depth < 4 {
-                    for child in children(directory) where !child.lastPathComponent.hasPrefix(".")
-                        && !["node_modules", "Library", "dist", "build", "target", "vendor", "Pods"].contains(child.lastPathComponent) {
+                    for child in entries where !child.lastPathComponent.hasPrefix(".")
+                        && !["node_modules", "Library", "dist", "build", "target", "vendor", "Pods", "DerivedData"].contains(child.lastPathComponent)
+                        && !["xcodeproj", "xcworkspace"].contains(child.pathExtension) {
                         stack.append((child, depth + 1))
                     }
                 }
