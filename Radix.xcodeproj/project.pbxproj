@@ -12,7 +12,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
-		3BF007FE2F7E285500DA9E45 /* Radix.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Radix.app; sourceTree = BUILT_PRODUCTS_DIR; };
+		3BF007FE2F7E285500DA9E45 /* DiskOdds.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = DiskOdds.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000003 /* RadixCoreTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; path = RadixCoreTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A10000000000000000000005 /* Radix.xctestplan */ = {isa = PBXFileReference; lastKnownFileType = text; path = Radix.xctestplan; sourceTree = "<group>"; };
 /* End PBXFileReference section */
@@ -72,7 +72,7 @@
 		3BF007FF2F7E285500DA9E45 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				3BF007FE2F7E285500DA9E45 /* Radix.app */,
+				3BF007FE2F7E285500DA9E45 /* DiskOdds.app */,
 				A10000000000000000000003 /* RadixCoreTests.xctest */,
 			);
 			name = Products;
@@ -99,7 +99,7 @@
 				3BBA11322F80739B009EFB1C /* Sparkle */,
 			);
 			productName = Radix;
-			productReference = 3BF007FE2F7E285500DA9E45 /* Radix.app */;
+			productReference = 3BF007FE2F7E285500DA9E45 /* DiskOdds.app */;
 			productType = "com.apple.product-type.application";
 		};
 		A10000000000000000000001 /* RadixCoreTests */ = {
@@ -340,7 +340,7 @@
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Radix/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = Radix;
+				INFOPLIST_KEY_CFBundleDisplayName = DiskOdds;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Colin Kim.";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -348,9 +348,9 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.8.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.colinkim.Radix;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kamatbot.DiskOdds;
+				PRODUCT_NAME = DiskOdds;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = NO;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -368,20 +368,20 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = NO;
-				CODE_SIGN_IDENTITY = "Developer ID Application";
-				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "Developer ID Application";
+				CODE_SIGN_IDENTITY = "-";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Manual;
 				COMBINE_HIDPI_IMAGES = YES;
 				CURRENT_PROJECT_VERSION = 14;
 				DEAD_CODE_STRIPPING = YES;
-				DEVELOPMENT_TEAM = 42MBX5D86L;
-				"DEVELOPMENT_TEAM[sdk=macosx*]" = 42MBX5D86L;
+				DEVELOPMENT_TEAM = "";
+				"DEVELOPMENT_TEAM[sdk=macosx*]" = "";
 				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = Radix/Info.plist;
-				INFOPLIST_KEY_CFBundleDisplayName = Radix;
+				INFOPLIST_KEY_CFBundleDisplayName = DiskOdds;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.utilities";
 				INFOPLIST_KEY_NSHumanReadableCopyright = "Copyright © 2026 Colin Kim.";
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -389,9 +389,9 @@
 					"@executable_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				MARKETING_VERSION = 1.8.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.colinkim.Radix;
-				PRODUCT_NAME = "$(TARGET_NAME)";
+				MARKETING_VERSION = 0.1.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kamatbot.DiskOdds;
+				PRODUCT_NAME = DiskOdds;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				REGISTER_APP_GROUPS = NO;
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
@@ -415,7 +415,7 @@
 					"@loader_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.colinkim.RadixCoreTests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kamatbot.DiskOddsExplorerTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 6.0;
@@ -434,7 +434,7 @@
 					"@loader_path/../Frameworks",
 				);
 				MACOSX_DEPLOYMENT_TARGET = 14.0;
-				PRODUCT_BUNDLE_IDENTIFIER = com.colinkim.RadixCoreTests;
+				PRODUCT_BUNDLE_IDENTIFIER = com.kamatbot.DiskOddsExplorerTests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_EMIT_LOC_STRINGS = NO;
 				SWIFT_VERSION = 6.0;

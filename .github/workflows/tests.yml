@@ -1,18 +1,14 @@
 name: Tests
-
 on:
   pull_request:
   push:
     branches: [main]
   workflow_dispatch:
-
 permissions:
   contents: read
-
 concurrency:
   group: tests-${{ github.ref }}
   cancel-in-progress: true
-
 jobs:
   tests:
     runs-on: macos-26
@@ -24,22 +20,45 @@ jobs:
         with:
           persist-credentials: false
       - name: Core tests through Swift Package Manager
-        run: swift test
+        run: |
+          set -euo pipefail
+          swift test 2>&1 | tee core-tests.log
       - name: Build app and run shared Xcode test plan
-        run: >-
-          xcodebuild test
-          -project Radix.xcodeproj
-          -scheme Radix
-          -configuration Debug
-          -destination 'platform=macOS'
-          -derivedDataPath .build/xcode-derived-data
-          -resultBundlePath .build/Tests.xcresult
+        run: |
+          set -euo pipefail
+          xcodebuild test -project Radix.xcodeproj -scheme Radix \
+            -configuration Debug -destination 'platform=macOS' \
+            -derivedDataPath .build/xcode-derived-data \
+            -resultBundlePath .build/Tests.xcresult CODE_SIGNING_ALLOWED=NO \
+            2>&1 | tee xcode-tests.log
+      - name: Non-destructive full-window preview
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          app="$PWD/.build/xcode-derived-data/Build/Products/Debug/DiskOdds.app"
+          open -n "$app" --args --diskodds-demo
+          sleep 8
+          window=$(swift -e 'import CoreGraphics; let windows = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]] ?? []; for w in windows where w[kCGWindowOwnerName as String] as? String == "DiskOdds" && w[kCGWindowLayer as String] as? Int == 0 { if let id = w[kCGWindowNumber as String] { print(id); break } }')
+          test -n "$window"
+          screencapture -x -o -l "$window" diskodds-preview.png
+      - name: Package unsigned Apple Silicon developer build
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent .build/xcode-derived-data/Build/Products/Debug/DiskOdds.app DiskOdds-macOS-arm64-unsigned.zip
+          git rev-parse HEAD > validated-commit.txt
+          git archive --format=zip --output=DiskOdds-source.zip HEAD
       - name: Preserve test results and coverage
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: test-results
-          path: .build/Tests.xcresult
+          path: |
+            .build/Tests.xcresult
+            core-tests.log
+            xcode-tests.log
+            diskodds-preview.png
+            DiskOdds-macOS-arm64-unsigned.zip
+            DiskOdds-source.zip
+            validated-commit.txt
           include-hidden-files: true
           if-no-files-found: ignore
           retention-days: 14
