@@ -57,6 +57,12 @@ actor CleanupExecutor {
         guard item.actionable, !keptPaths.contains(where: { $0 == item.path || CleanupPolicy.contains($0, item.path) }) else {
             throw CleanupFailure.rejected("This item is protected or not actionable.")
         }
+        #if os(macOS)
+        let runningApp = Bundle.main.bundleURL.path
+        guard item.path != runningApp, !CleanupPolicy.contains(item.path, runningApp) else {
+            throw CleanupFailure.rejected("The selected folder contains the running DiskOdds app. Keep it and clean other builds.")
+        }
+        #endif
         let url = URL(fileURLWithPath: item.path)
         try CleanupFileSystem.validatePath(url)
         guard try CleanupFileSystem.measure(url) == item.snapshot else {

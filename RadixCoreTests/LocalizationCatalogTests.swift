@@ -234,7 +234,7 @@ struct LocalizationCatalogTests {
             try swiftSourceFiles(in: appSourceRoot).compactMap { url -> String? in
                 let relativePath = String(url.path.dropFirst(appSourceRoot.path.count + 1))
                 let firstComponent = relativePath.split(separator: "/").first.map(String.init)
-                if ["App", "Features", "Shared"].contains(firstComponent) { return nil }
+                if ["App", "Features", "Shared", "DeveloperCleanup"].contains(firstComponent) { return nil }
                 if ["ContentView.swift", "RadixApp.swift"].contains(relativePath) { return nil }
                 return relativePath
             })
@@ -351,7 +351,7 @@ struct LocalizationCatalogTests {
             of: #"%(?:[0-9]+\$)?(?:lld|ld|llu|lu|d|u|f|@)"#,
             with: "{value}",
             options: .regularExpression
-        )
+        ).replacingOccurrences(of: "%%", with: "%")
     }
 
     private func replacingSwiftInterpolations(in value: String, with replacement: String) -> String {

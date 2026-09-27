@@ -78,6 +78,7 @@ nonisolated enum CleanupFileSystem {
                 if st.st_mode & S_IFMT == S_IFLNK { enumerator.skipDescendants() }
                 let name = child.lastPathComponent.lowercased()
                 if [".git", ".env", "credentials", "auth.json"].contains(name)
+                    || name.hasPrefix(".env.") || name.hasSuffix(".p12") || name.hasSuffix(".mobileprovision")
                     || name.hasSuffix(".xcarchive") || name.hasSuffix(".keychain-db") {
                     complete = false
                     enumerator.skipDescendants()
