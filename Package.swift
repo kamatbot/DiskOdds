@@ -19,6 +19,7 @@ let package = Package(
             path: "Radix",
             exclude: [
                 "App",
+                "DeveloperCleanup",
                 "AppIcon.icon",
                 "Assets.xcassets",
                 "ContentView.swift",
@@ -125,6 +126,15 @@ let package = Package(
                 .enableUpcomingFeature("InferIsolatedConformances"),
                 .enableUpcomingFeature("NonisolatedNonsendingByDefault")
             ]
+        ),
+        .target(
+            name: "DiskOddsCore",
+            path: "Radix/DeveloperCleanup/Core"
+        ),
+        .testTarget(
+            name: "DiskOddsCoreTests",
+            dependencies: ["DiskOddsCore"],
+            path: "DiskOddsCoreTests"
         ),
         .testTarget(
             name: "RadixCoreTests",

@@ -14,21 +14,13 @@
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
 			<key>LSHandlerRank</key>
-			<string>Owner</string>
+			<string>Alternate</string>
 			<key>LSItemContentTypes</key>
 			<array>
 				<string>dev.colinkim.radix.scan</string>
 			</array>
 		</dict>
 	</array>
-	<key>SUFeedURL</key>
-	<string>https://tryradix.app/appcast.xml</string>
-	<key>SUPublicEDKey</key>
-	<string>p8XNK5WipyOCtLH5ETLxpulo1nc2aY7detwrhjxNKIs=</string>
-	<key>SUEnableAutomaticChecks</key>
-	<true/>
-	<key>SUScheduledCheckInterval</key>
-	<integer>86400</integer>
 	<key>UTExportedTypeDeclarations</key>
 	<array>
 		<dict>
