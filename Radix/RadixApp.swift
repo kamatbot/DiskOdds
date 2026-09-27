@@ -1,63 +1,36 @@
-//
-//  RadixApp.swift
-//  Radix
-//
-//  Created by Colin Kim on 4/1/26.
-//
-
+// DiskOdds is based on Radix by Colin Kim. See LICENSE and DISKODDS-UPSTREAM.md.
 import AppKit
-import Sparkle
 import SwiftUI
 
 @main
 struct RadixApp: App {
     @StateObject private var appModel = AppModel()
-    @StateObject private var softwareUpdates: SoftwareUpdateModel
-    private let updaterController: SPUStandardUpdaterController
-    private let issueReportURL = URL(string: "https://github.com/colinvkim/Radix/issues/new/choose")
-
-    init() {
-        let updaterController = SPUStandardUpdaterController(
-            startingUpdater: true,
-            updaterDelegate: nil,
-            userDriverDelegate: nil
-        )
-        self.updaterController = updaterController
-        _softwareUpdates = StateObject(wrappedValue: SoftwareUpdateModel(updater: updaterController.updater))
-    }
+    @StateObject private var softwareUpdates = SoftwareUpdateModel()
+    @State private var workspaceMode = 0
 
     var body: some Scene {
-        Window("Radix", id: "main") {
-            ContentView()
+        Window("DiskOdds", id: "main") {
+            DiskOddsWorkspaceView(mode: $workspaceMode)
                 .environmentObject(appModel)
-                .frame(minWidth: 1180, maxWidth: .infinity, minHeight: 620, maxHeight: .infinity)
+                .frame(minWidth: 1180, maxWidth: .infinity, minHeight: 680, maxHeight: .infinity)
         }
-        .defaultSize(width: 1480, height: 820)
+        .defaultSize(width: 1480, height: 900)
         .windowResizability(.contentMinSize)
         .commands {
-            RadixCommands(
-                appModel: appModel,
-                scanState: appModel.scanState,
-                navigation: appModel.navigation,
-                workspaceTour: appModel.workspaceTour
-            )
-
-            CommandGroup(after: .appInfo) {
-                CheckForUpdatesView(softwareUpdates: softwareUpdates)
+            if workspaceMode == 1 {
+                RadixCommands(appModel: appModel, scanState: appModel.scanState,
+                              navigation: appModel.navigation, workspaceTour: appModel.workspaceTour)
             }
-
             CommandGroup(after: .help) {
-                Button("Report Issue…", systemImage: "flag") {
-                    if let issueReportURL {
-                        NSWorkspace.shared.open(issueReportURL)
+                Button("Report DiskOdds Issue…", systemImage: "flag") {
+                    if let url = URL(string: "https://github.com/kamatbot/DiskOdds/issues/new") {
+                        NSWorkspace.shared.open(url)
                     }
                 }
             }
         }
-
         Settings {
-            SettingsView(softwareUpdates: softwareUpdates)
-                .environmentObject(appModel)
+            SettingsView(softwareUpdates: softwareUpdates).environmentObject(appModel)
         }
     }
 }

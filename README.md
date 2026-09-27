@@ -1,160 +1,60 @@
-<div align="center">
-  <img src="./icon.png" alt="Radix" width="220">
-</div>
+# DiskOdds
 
-<h1 align="center">Radix</h1>
+**Make room to build.** Native macOS storage analysis for developers working with coding agents, Xcode, simulators, web frameworks, and local AI models.
 
-A fast, native macOS disk space analyzer that makes crowded drives easy to understand. Scan folders and volumes, explore where your storage is going, compare results over time, and safely clean up — all without leaving the app. Visit the [Radix website](https://tryradix.app) to learn more!
+DiskOdds extends [Radix by Colin Kim](https://github.com/colinvkim/Radix). The complete upstream source, tests, assets, and history are retained, along with its [MIT license](LICENSE). The original disk explorer remains available beside the new developer-cleanup workspace. The upstream auto-update feed is disabled and DiskOdds uses its own bundle identity.
 
-## Why Radix?
+## Developer cleanup
 
-Storage fills up quietly. Radix makes it obvious where it went — no Terminal commands, no waiting through scans that crawl forever. Point it at a folder, sit back, and explore a clean visual breakdown of directories and files.
+The new home screen combines actual home-volume free space, a developer-footprint treemap, sortable/filterable candidates, and an evidence inspector. Tile area represents observed disk footprint; color and a percentage represent rule-based cleanup confidence. Nothing is selected by default.
 
-It's built with Swift and SwiftUI, designed to feel like a natural part of macOS.
+| Category | Detection and action |
+|---|---|
+| Xcode leftovers | Per-project `Build` and `Index.noindex` directories under default DerivedData, plus known compiler caches. Review and move to Trash. SourcePackages and archives are excluded. |
+| Package caches | Homebrew, CocoaPods, pip, uv, SwiftPM download caches, and npm `_cacache`. Review redownload/offline trade-offs, then move to Trash. |
+| Project caches | Opt-in project folders; known Next.js, Turborepo, Parcel, and dependency-tool caches. Require both Git-ignored paths and no tracked files. Never remove entire repositories or node_modules. |
+| Simulator devices | Live `simctl` inventory. Only unavailable, shut-down devices are executable candidates. Exact UUID deletion requires a separate `DELETE` confirmation because simulator app data is permanent. |
+| Simulator runtimes | Inventory with guidance to use Xcode's component manager. No raw deletion of shared or mounted runtime bundles. |
+| Local models | Footprint and guidance for Ollama, Hugging Face hub/Xet, and LM Studio model stores. These are managed-only items in this release, not automatically deleted or claimed to be unused. |
 
-## Highlights
+This catches common outputs created during Codex/Claude development without deleting agent conversations, credentials, or working trees. It does not infer which agent created a file from its name.
 
-### Visualize Disk Usage
+### What the odds mean
 
-Switch between **sunburst** and **treemap** views to understand how space is distributed. Hover over an item to inspect it, then double-click a folder to drill deeper.
+**Percentages are transparent heuristic scores, not statistically calibrated probabilities or guarantees.** An unchanged recognized Xcode cache/build directory can score 98%; a package cache 96%; an ignored project cache 94%. Recent changes reduce these scores to 65%. The seven-day threshold uses the newest observed modification in the candidate tree, not just its parent directory. Modification time is not proof of last use.
 
-|                                  Sunburst                                  |                                 Treemap                                  |
-| :------------------------------------------------------------------------: | :----------------------------------------------------------------------: |
-| ![Radix sunburst disk-usage visualization](docs/images/radix-sunburst.png) | ![Radix treemap disk-usage visualization](docs/images/radix-treemap.png) |
+Unavailable simulators remain at 80% because their app data can be unique. Model stores stay at 40%, available devices at 45%, and runtimes at 50%; these scores do not establish that a model/runtime is unused. Incomplete scans score 0% and cannot be cleaned. The `95%+` button selects eligible candidates only after an explicit click and still requires review.
 
-### Browse and Search
+### Safety and space accounting
 
-Use the sortable file browser to inspect items, search the current focus or the entire scan, and filter by item kind or allocated size. Preview files with Quick Look and navigate scans with breadcrumbs and back/forward navigation.
+Scans are read-only, cancellable, bounded, and local. Before cleanup, the entire plan and then each target are revalidated: known path, ownership, symlink ancestry, metadata fingerprint, keep rules, Git tracking, and simulator state where applicable. Recognized running development tools block cleanup; there is no force override. Errors stop the remaining plan.
 
-### Compare Scans Over Time
+Builds and caches go to macOS Trash, with receipts and Finder links. **Moving files to Trash does not reclaim space until you empty it yourself.** Test your projects first. DiskOdds never automatically empties Trash. Simulator deletion is permanent and is clearly separated from recoverable cleanup.
 
-Compare two scans to see which files and folders grew, shrank, appeared, or disappeared.
+Footprint estimates use allocated blocks and exclude multiply-linked regular-file blocks. Parent/child candidates are de-duplicated. APFS clones, snapshots, shared files, permissions, and mounted runtimes mean estimated footprint is not a promise of free space. Actual volume availability is refreshed by a rescan.
 
-![Radix scan comparison showing files and folders that changed over time](docs/images/radix-scan-comparison.png)
+## Build and test
 
-### Review Cleanup Candidates
-
-Add items from the disk map, file browser, or inspector to the **Discard Pile**. Review everything together before deciding whether to move anything to the Trash.
-
-### Save and Reopen Results
-
-Export completed scans as compact, losslessly compressed `.radixscan` snapshots and reopen them later as read-only results.
-
-## More Features
-
-- Fast, iterative file-system scanning with live progress
-- Faster follow-up scans by reusing previous results when possible
-- Automatic summarization of directories containing thousands of tiny files
-- Custom scan exclusions for paths you do not want to include
-- Optional free-space display in disk maps
-- Smart Locations for mounted volumes, Home, Desktop, Documents, Downloads, Library, and Applications
-- Recent scan history in the sidebar
-- Detailed inspector with sizes, access information, parent directory, and largest children
-- Usage stats showing scans completed, data scanned, scan speeds, chart interactions, and cleanup totals — all stored locally on your Mac
-- Reveal in Finder, Copy Path, Move to Trash, and more actions
-- Drag and drop a folder into the window to start scanning
-- APFS-aware storage accounting that avoids double-counting full clones and detects partial clones
-- Welcome flow with an onboarding and an interactive tour of the app
-- Available in English, German, Spanish, French, Italian, Russian, and Simplified Chinese
-- Automatic updates powered by [Sparkle](https://sparkle-project.org/)
-
-### Privacy & Permissions
-
-Radix works out of the box on any folder you can already access. For some folders, the app may require **Full Disk Access**. Radix detects when files are skipped due to permissions and guides you through enabling them in System Settings.
-
-## Installation
-
-Radix requires **macOS Sonoma 14 or later**.
-
-### Homebrew
+Requires macOS 14 or later and Xcode 26.6 / Swift 6.2 or later. The project and scheme retain the upstream name to simplify maintenance; the resulting app is **DiskOdds.app**.
 
 ```bash
-brew install --cask radix
-```
-
-### Manual Installation
-
-Download the latest version from [Releases](https://github.com/colinvkim/Radix/releases/latest) or the [Radix website](https://tryradix.app), then drag Radix into your Applications folder.
-
-## Developer Documentation
-
-<details>
-<summary>View build instructions, project structure, and architecture</summary>
-
-## Building from Source
-
-Building Radix requires **Xcode 26 or later** with a Swift 6.2 toolchain.
-
-Clone the repository and run the Swift package tests:
-
-```bash
-git clone https://github.com/colinvkim/Radix.git
-cd Radix
 swift test
+xcodebuild -project Radix.xcodeproj -scheme Radix \
+  -configuration Debug -destination 'platform=macOS' \
+  -derivedDataPath .build/xcode-derived-data CODE_SIGNING_ALLOWED=NO build
+open -n .build/xcode-derived-data/Build/Products/Debug/DiskOdds.app
 ```
 
-Open `Radix.xcodeproj` in Xcode to build and run the complete app, or build it from the command line:
+For a clearly labeled, non-destructive design preview:
 
 ```bash
-xcodebuild \
-  -project Radix.xcodeproj \
-  -scheme Radix \
-  -configuration Debug \
-  -destination 'platform=macOS' \
-  build
+open -n .build/xcode-derived-data/Build/Products/Debug/DiskOdds.app --args --diskodds-demo
 ```
 
-The SwiftPM package contains `RadixCore` and its Swift Testing suite. The shared Xcode scheme runs the same core tests: use **Product → Test** (Cmd-U), or replace `build` with `test` in the command above.
+`DiskOddsCoreTests` covers confidence rules, path boundaries, overlapping selections, changed metadata, symlink rejection, protected contents, and simulator eligibility. The original `RadixCoreTests` suite is retained. The new core is also portable enough to test on Linux, but the app and Trash integration require macOS. This repository is a source/developer build, not a signed or notarized distribution.
 
-## Project Structure
+## Scope and limitations
 
-```text
-Radix/
-├── Radix/                    # App and core source code
-│   ├── App/                  # App entry point, commands, and window management
-│   ├── Models/               # Scan targets, node records, snapshots, and safety models
-│   ├── Services/             # Scanning, archives, comparison, geometry, and formatting
-│   ├── ViewModels/           # Application state and UI coordination
-│   ├── Features/
-│   │   ├── Comparison/       # Scan comparison setup and results
-│   │   ├── DiscardPile/      # Cleanup candidate review
-│   │   ├── FileList/         # Sortable file browser
-│   │   ├── Inspector/        # Single- and multiple-selection details and actions
-│   │   ├── Onboarding/       # Welcome flow, permission guidance, and workspace tour
-│   │   ├── Settings/         # Scan, visualization, and app preferences
-│   │   ├── Sidebar/          # Smart Locations, recent scans, and Discard Pile
-│   │   ├── Visualization/    # Sunburst and treemap views
-│   │   └── Workspace/        # Main scanning and exploration interface
-│   └── Shared/               # Reusable SwiftUI components and helpers
-├── RadixCoreTests/           # Unit, integration, and benchmark-style tests
-├── Package.swift             # RadixCore Swift package definition
-└── Radix.xcodeproj/          # Complete macOS app project
-```
+The first cleanup UI is in English; the inherited explorer retains its existing locales. Default Xcode locations and common model directories are supported. Custom DerivedData directories, arbitrary temporary folders, `.build`, general `build`/`dist` folders, Docker volumes, agent worktree pruning, and model-level deletion are deliberately not inferred as disposable. Add explicit, tested adapters rather than broad filename rules. GUI apps may not inherit shell environment variables for custom model stores.
 
-## Architecture
-
-- `ScanEngine` is an actor-based asynchronous scanner that uses iterative file-system traversal. `ScanCoordinator` owns scan state, while `IncrementalScanService` reuses prior results when it can safely reconcile filesystem changes.
-- `AppModel` is the central `@MainActor` state and coordination layer for the application.
-- `ScanSnapshot` and `FileTreeStore` represent scan results using flat tree storage and indexed lookups.
-- Archive and comparison services stream, validate, and compare `.radixscan`
-  snapshots. Format v5 losslessly compresses the large node and topology
-  sections with LZFSE while retaining v3/v4 import compatibility.
-- Sunburst and treemap services separate layout and interaction models from their SwiftUI presentation.
-- `RadixCore` has no external Swift package dependencies. The app uses Sparkle for updates.
-
-</details>
-
-## Contributing
-
-Contributions are welcome! Here's how to get started:
-
-1. Fork the repository and create a feature branch. Before getting started, consider reviewing the developer documentation above for build instructions and an overview of the project’s structure and architecture.
-2. Make your changes and add or update tests where appropriate. Keep them focused and well-documented.
-3. Run `swift test`.
-4. Open a pull request explaining what changed and why.
-
-Use [Conventional Commits](https://www.conventionalcommits.org/) for commit messages and PR titles. If you're tackling something big, consider opening an issue first so the approach can be discussed.
-
-## License
-
-Radix is available under the [MIT License](LICENSE).
+Read [the safety design and validation checklist](docs/CLEANUP-SAFETY.md), [upstream provenance](DISKODDS-UPSTREAM.md), and [the preserved upstream README](docs/RADIX-UPSTREAM.md).

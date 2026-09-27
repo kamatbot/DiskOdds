@@ -1,0 +1,58 @@
+name: Configure and validate DiskOdds
+on:
+  push:
+    branches: [feat/vibecoder-cleanup]
+    paths: [scripts/configure-diskodds.py, .github/workflows/configure-diskodds.yml]
+permissions:
+  contents: write
+concurrency:
+  group: configure-diskodds
+  cancel-in-progress: false
+jobs:
+  native:
+    if: github.repository == 'kamatbot/DiskOdds'
+    runs-on: macos-26
+    timeout-minutes: 25
+    env:
+      DEVELOPER_DIR: /Applications/Xcode_26.6.app/Contents/Developer
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          ref: feat/vibecoder-cleanup
+      - name: Apply pinned upstream migration and commit generated configuration
+        run: |
+          set -euo pipefail
+          python3 scripts/configure-diskodds.py
+          git config user.name DiskOdds
+          git config user.email 289325931+kamatbot@users.noreply.github.com
+          git add Package.swift Radix.xcodeproj Radix/Info.plist Radix/InfoPlist.xcstrings docs/RADIX-UPSTREAM.md
+          if ! git diff --cached --quiet; then
+            git commit -m 'build: isolate DiskOdds identity and wire cleanup core tests'
+            git push origin HEAD:feat/vibecoder-cleanup
+          fi
+      - name: Run all core tests
+        run: swift test 2>&1 | tee core-tests.log
+      - name: Build native application
+        run: |
+          set -o pipefail
+          xcodebuild -project Radix.xcodeproj -scheme Radix -configuration Debug \
+            -destination 'platform=macOS' -derivedDataPath .build/xcode-derived-data \
+            CODE_SIGNING_ALLOWED=NO build 2>&1 | tee app-build.log
+      - name: Capture non-destructive design preview
+        continue-on-error: true
+        run: |
+          app="$PWD/.build/xcode-derived-data/Build/Products/Debug/DiskOdds.app"
+          open -n "$app" --args --diskodds-demo
+          sleep 8
+          screencapture -x diskodds-preview.png
+      - name: Preserve logs and preview
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: diskodds-validation
+          path: |
+            core-tests.log
+            app-build.log
+            diskodds-preview.png
+          retention-days: 7
