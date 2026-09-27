@@ -1,0 +1,6 @@
+.build/
+*.xcuserstate
+xcuserdata/
+Radix.xcodeproj/xcuserdata/
+Sparkle-*/
+releases/

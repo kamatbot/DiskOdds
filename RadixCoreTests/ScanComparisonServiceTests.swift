@@ -1,0 +1,2137 @@
+import Foundation
+import Testing
+
+@testable import RadixCore
+
+struct ScanComparisonServiceTests {
+    @Test
+    func testLogicalScopeComparesIdenticallyToMaterializedSubtree() async throws {
+        let visible = makeTestFileNode(id: "/root/Home/file.bin", name: "file.bin", size: 25)
+        let home = makeTestDirectoryNode(id: "/root/Home", name: "Home", children: [visible])
+        let outside = makeTestFileNode(id: "/root/System.bin", name: "System.bin", size: 100)
+        let root = makeTestDirectoryNode(id: "/root", name: "root", children: [home, outside])
+        let store = FileTreeStore(
+            root: root,
+            childrenByID: [
+                root.id: [home, outside],
+                home.id: [visible],
+            ])
+        let logicalScope = try #require(store.logicalScope(rootedAt: home.id))
+        let materializedScope = try #require(store.subtree(rootedAt: home.id))
+
+        let comparison = try await ScanComparisonService().compare(
+            before: makeTestSnapshot(root: logicalScope.root, store: logicalScope),
+            after: makeTestSnapshot(root: materializedScope.root, store: materializedScope)
+        )
+
+        #expect(comparison.rows.isEmpty)
+        #expect(comparison.summary.allocatedDelta == 0)
+        #expect(comparison.summary.fileCountDelta == 0)
+    }
+
+    @Test
+    func testComparesSnapshotsByRelativePathAcrossDifferentRoots() async throws {
+        let beforeFile = makeTestFileNode(id: "/before/shared.bin", name: "shared.bin", size: 10)
+        let beforeRoot = makeTestDirectoryNode(id: "/before", name: "before", children: [beforeFile])
+        let beforeStore = FileTreeStore(root: beforeRoot, childrenByID: [beforeRoot.id: [beforeFile]])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterFile = makeTestFileNode(id: "/after/shared.bin", name: "shared.bin", size: 25)
+        let afterRoot = makeTestDirectoryNode(id: "/after", name: "after", children: [afterFile])
+        let afterStore = FileTreeStore(root: afterRoot, childrenByID: [afterRoot.id: [afterFile]])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(comparison.rows.count == 1)
+        #expect(comparison.rows[0].relativePath == "shared.bin")
+        #expect(comparison.rows[0].kind == .grew)
+        #expect(comparison.rows[0].allocatedDelta == 15)
+        #expect(comparison.summary.allocatedDelta == 15)
+        #expect(comparison.summary.grewCount == 1)
+    }
+
+    @Test
+    func testAddedAndRemovedDirectoriesSuppressDescendantRows() async throws {
+        let removedChild = makeTestFileNode(id: "/root/removed/child.bin", name: "child.bin", size: 30)
+        let removedFolder = makeTestDirectoryNode(id: "/root/removed", name: "removed", children: [removedChild])
+        let sharedBefore = makeTestFileNode(id: "/root/shared.bin", name: "shared.bin", size: 10)
+        let beforeRoot = makeTestDirectoryNode(
+            id: "/root",
+            name: "root",
+            children: [removedFolder, sharedBefore]
+        )
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [removedFolder, sharedBefore],
+                removedFolder.id: [removedChild],
+            ])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let addedChild = makeTestFileNode(id: "/root/added/child.bin", name: "child.bin", size: 80)
+        let addedFolder = makeTestDirectoryNode(id: "/root/added", name: "added", children: [addedChild])
+        let sharedAfter = makeTestFileNode(id: "/root/shared.bin", name: "shared.bin", size: 45)
+        let afterRoot = makeTestDirectoryNode(
+            id: "/root",
+            name: "root",
+            children: [addedFolder, sharedAfter]
+        )
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [addedFolder, sharedAfter],
+                addedFolder.id: [addedChild],
+            ])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(
+            comparison.rows.map { "\($0.kind.rawValue):\($0.relativePath)" } == [
+                "added:added",
+                "grew:shared.bin",
+                "removed:removed",
+            ])
+        #expect(!(comparison.rows.contains { $0.relativePath.contains("child.bin") }))
+        #expect(comparison.summary.addedCount == 1)
+        #expect(comparison.summary.removedCount == 1)
+        #expect(comparison.summary.grewCount == 1)
+        #expect(comparison.summary.changedCount == 1)
+    }
+
+    @Test
+    func testFileDirectoryReplacementsKeepComparisonRowsNonOverlapping() async throws {
+        let file = makeTestFileNode(id: "/root/item", name: "item", size: 100)
+        let fileRoot = makeTestDirectoryNode(id: "/root", name: "root", children: [file])
+        let fileSnapshot = makeTestSnapshot(
+            root: fileRoot,
+            store: FileTreeStore(
+                root: fileRoot, childrenByID: [fileRoot.id: [file]]
+            ))
+
+        for rootPath in ["/root", "/other-root"] {
+            for size: Int64 in [100, 200] {
+                let child = makeTestFileNode(id: rootPath + "/item/child", name: "child", size: size)
+                let directory = makeTestDirectoryNode(id: rootPath + "/item", name: "item", children: [child])
+                let root = makeTestDirectoryNode(id: rootPath, name: "root", children: [directory])
+                let directorySnapshot = makeTestSnapshot(
+                    root: root,
+                    store: FileTreeStore(
+                        root: root, childrenByID: [root.id: [directory], directory.id: [child]]
+                    ))
+                for (before, after) in [(fileSnapshot, directorySnapshot), (directorySnapshot, fileSnapshot)] {
+                    let comparison = try await ScanComparisonService().compare(before: before, after: after)
+                    let delta = comparison.summary.allocatedDelta
+                    #expect(comparison.rows.map(\.relativePath) == (delta == 0 ? [] : ["item"]))
+                    #expect(comparison.summary.attributedAllocatedDelta == delta)
+                    #expect(comparison.summary.grossIncreasedAllocatedSize == max(delta, 0))
+                    #expect(comparison.summary.grossReclaimedAllocatedSize == max(-delta, 0))
+                }
+            }
+        }
+    }
+
+    @Test
+    func testReplacementAndMaterializationMatrixKeepsAccountingBalanced() async throws {
+        enum Shape: CaseIterable {
+            case missing, emptyFile, file, symlink, emptyDirectory, flat, nested, summarized
+        }
+        func snapshot(rootPath: String, shape: Shape, movedName: String) -> ScanSnapshot {
+            let itemPath = rootPath + "/item"
+            var childrenByID: [String: [FileNodeRecord]] = [:]
+            let item: FileNodeRecord?
+            switch shape {
+            case .missing:
+                item = nil
+            case .emptyFile, .file, .symlink:
+                item = makeTestFileNode(
+                    id: itemPath, name: "item", size: shape == .file ? 100 : 0,
+                    isSymbolicLink: shape == .symlink
+                )
+            case .emptyDirectory:
+                item = makeTestDirectoryNode(id: itemPath, name: "item", children: [])
+            case .flat:
+                let child = makeTestFileNode(id: itemPath + "/child", name: "child", size: 100)
+                item = makeTestDirectoryNode(id: itemPath, name: "item", children: [child])
+                childrenByID[itemPath] = [child]
+            case .nested:
+                let child = makeTestFileNode(id: itemPath + "/nested/child", name: "child", size: 200)
+                let nested = makeTestDirectoryNode(id: itemPath + "/nested", name: "nested", children: [child])
+                item = makeTestDirectoryNode(id: itemPath, name: "item", children: [nested])
+                childrenByID[itemPath] = [nested]
+                childrenByID[nested.id] = [child]
+            case .summarized:
+                item = makeTestSummarizedDirectoryNode(id: itemPath, name: "item", size: 180)
+            }
+            let moved = makeTestFileNode(
+                id: rootPath + "/" + movedName, name: movedName, size: 20,
+                fileIdentity: FileIdentity(device: 1, inode: 1000)
+            )
+            let children = [item, moved].compactMap { $0 }
+            let root = makeTestDirectoryNode(id: rootPath, name: "root", children: children)
+            childrenByID[rootPath] = children
+            return makeTestSnapshot(root: root, store: FileTreeStore(root: root, childrenByID: childrenByID))
+        }
+
+        for beforeShape in Shape.allCases {
+            for afterShape in Shape.allCases {
+                for afterRoot in ["/root", "/other-root"] {
+                    let comparison = try await ScanComparisonService().compare(
+                        before: snapshot(rootPath: "/root", shape: beforeShape, movedName: "old"),
+                        after: snapshot(rootPath: afterRoot, shape: afterShape, movedName: "new")
+                    )
+                    let context = "\(beforeShape) -> \(afterShape), \(afterRoot)"
+                    #expect(
+                        comparison.summary.attributedAllocatedDelta == comparison.summary.allocatedDelta,
+                        Comment(rawValue: context))
+                    #expect(comparison.summary.movedCount == 1, Comment(rawValue: context))
+                    for row in comparison.rows {
+                        #expect(
+                            !(comparison.rows.contains {
+                                $0.relativePath.hasPrefix(row.relativePath + "/")
+                            }), Comment(rawValue: context))
+                    }
+                }
+            }
+        }
+    }
+
+    @Test
+    func testNestedFileGrowthDoesNotEmitAncestorDirectoryRows() async throws {
+        let beforeLeaf = makeTestFileNode(id: "/root/a/b/file.bin", name: "file.bin", size: 10)
+        let beforeInner = makeTestDirectoryNode(id: "/root/a/b", name: "b", children: [beforeLeaf])
+        let beforeOuter = makeTestDirectoryNode(id: "/root/a", name: "a", children: [beforeInner])
+        let beforeRoot = makeTestDirectoryNode(id: "/root", name: "root", children: [beforeOuter])
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforeOuter],
+                beforeOuter.id: [beforeInner],
+                beforeInner.id: [beforeLeaf],
+            ])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterLeaf = makeTestFileNode(id: "/root/a/b/file.bin", name: "file.bin", size: 100)
+        let afterInner = makeTestDirectoryNode(id: "/root/a/b", name: "b", children: [afterLeaf])
+        let afterOuter = makeTestDirectoryNode(id: "/root/a", name: "a", children: [afterInner])
+        let afterRoot = makeTestDirectoryNode(id: "/root", name: "root", children: [afterOuter])
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterOuter],
+                afterOuter.id: [afterInner],
+                afterInner.id: [afterLeaf],
+            ])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(comparison.rows.count == 1)
+        #expect(comparison.rows[0].relativePath == "a/b/file.bin")
+        #expect(comparison.rows[0].kind == .grew)
+        #expect(comparison.rows[0].allocatedDelta == 90)
+        #expect(!(comparison.rows.contains { $0.isDirectory }))
+        #expect(comparison.summary.fileCountDelta == 0)
+        #expect(comparison.summary.grewCount == 1)
+        #expect(comparison.summary.changedCount == 1)
+        // The aggregate delta still reflects the full change even though no directory row is emitted.
+        #expect(comparison.summary.allocatedDelta == 90)
+    }
+
+    @Test
+    func testSummarizedLeafDirectoryGrowthEmitsRow() async throws {
+        // An auto-summarized directory is a leaf node with no indexed children, so its size
+        // change has no descendant rows to represent it and must be reported directly.
+        let beforeCache = makeTestSummarizedDirectoryNode(id: "/before/cache", name: "cache", size: 100)
+        let beforeRoot = makeTestDirectoryNode(id: "/before", name: "before", children: [beforeCache])
+        let beforeStore = FileTreeStore(root: beforeRoot, childrenByID: [beforeRoot.id: [beforeCache]])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterCache = makeTestSummarizedDirectoryNode(id: "/after/cache", name: "cache", size: 500)
+        let afterRoot = makeTestDirectoryNode(id: "/after", name: "after", children: [afterCache])
+        let afterStore = FileTreeStore(root: afterRoot, childrenByID: [afterRoot.id: [afterCache]])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(comparison.rows.count == 1)
+        #expect(comparison.rows[0].relativePath == "cache")
+        #expect(comparison.rows[0].kind == .grew)
+        #expect(comparison.rows[0].isDirectory)
+        #expect(comparison.rows[0].allocatedDelta == 400)
+        #expect(comparison.summary.grewCount == 1)
+    }
+
+    @Test
+    func testExpandedVersionOfSummarizedDirectorySuppressesMaterializedDescendants() async throws {
+        let beforeCache = makeTestSummarizedDirectoryNode(id: "/root/cache", name: "cache", size: 100)
+        let beforeRoot = makeTestDirectoryNode(id: "/root", name: "root", children: [beforeCache])
+        let beforeStore = FileTreeStore(root: beforeRoot, childrenByID: [beforeRoot.id: [beforeCache]])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterLeaf = makeTestFileNode(id: "/root/cache/file.bin", name: "file.bin", size: 100)
+        let afterCache = makeTestDirectoryNode(id: "/root/cache", name: "cache", children: [afterLeaf])
+        let afterRoot = makeTestDirectoryNode(id: "/root", name: "root", children: [afterCache])
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterCache],
+                afterCache.id: [afterLeaf],
+            ])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(comparison.rows.isEmpty)
+        #expect(comparison.summary.allocatedDelta == 0)
+        #expect(comparison.summary.changedCount == 0)
+    }
+
+    @Test
+    func testMaterializationBoundaryDiscoveryChecksEveryChangedPathAncestor() async throws {
+        let beforeCache = makeTestSummarizedDirectoryNode(
+            id: "/before/a/cache",
+            name: "cache",
+            size: 100
+        )
+        let beforeA = makeTestDirectoryNode(id: "/before/a", name: "a", children: [beforeCache])
+        let beforeRoot = makeTestDirectoryNode(id: "/before", name: "before", children: [beforeA])
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforeA],
+                beforeA.id: [beforeCache],
+            ])
+
+        let afterLeaf = makeTestFileNode(id: "/after/a/cache/file.bin", name: "file.bin", size: 100)
+        let afterCache = makeTestDirectoryNode(id: "/after/a/cache", name: "cache", children: [afterLeaf])
+        let afterA = makeTestDirectoryNode(id: "/after/a", name: "a", children: [afterCache])
+        let afterRoot = makeTestDirectoryNode(id: "/after", name: "after", children: [afterA])
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterA],
+                afterA.id: [afterCache],
+                afterCache.id: [afterLeaf],
+            ])
+
+        let comparison = try await ScanComparisonService().compare(
+            before: makeTestSnapshot(root: beforeRoot, store: beforeStore),
+            after: makeTestSnapshot(root: afterRoot, store: afterStore)
+        )
+
+        #expect(comparison.rows.isEmpty)
+        #expect(comparison.summary.allocatedDelta == 0)
+    }
+
+    @Test
+    func testExpandedVersionOfSummarizedDirectoryReportsOnlyBoundaryDelta() async throws {
+        let beforeCache = makeTestSummarizedDirectoryNode(id: "/before/cache", name: "cache", size: 100)
+        let beforeRoot = makeTestDirectoryNode(id: "/before", name: "before", children: [beforeCache])
+        let beforeStore = FileTreeStore(root: beforeRoot, childrenByID: [beforeRoot.id: [beforeCache]])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterLeaf = makeTestFileNode(id: "/after/cache/file.bin", name: "file.bin", size: 150)
+        let afterCache = makeTestDirectoryNode(id: "/after/cache", name: "cache", children: [afterLeaf])
+        let afterRoot = makeTestDirectoryNode(id: "/after", name: "after", children: [afterCache])
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterCache],
+                afterCache.id: [afterLeaf],
+            ])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(comparison.rows.count == 1)
+        #expect(comparison.rows[0].relativePath == "cache")
+        #expect(comparison.rows[0].kind == .grew)
+        #expect(comparison.rows[0].allocatedDelta == 50)
+        #expect(comparison.summary.allocatedDelta == 50)
+    }
+
+    @Test
+    func testNewHardLinkDoesNotMoveAllocatedSizeFromSharedPath() async throws {
+        let identity = FileIdentity(device: 1, inode: 42)
+        let beforeShared = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 100,
+            unduplicatedAllocatedSize: 100,
+            fileIdentity: identity,
+            linkCount: 1
+        )
+        let beforeRoot = makeTestDirectoryNode(id: "/root", name: "root", children: [beforeShared])
+        let beforeStore = FileTreeStore(root: beforeRoot, childrenByID: [beforeRoot.id: [beforeShared]])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterNewLink = makeTestFileNode(
+            id: "/root/a/new.bin",
+            name: "new.bin",
+            size: 100,
+            unduplicatedAllocatedSize: 100,
+            fileIdentity: identity,
+            linkCount: 2
+        )
+        let afterFolder = makeTestDirectoryNode(id: "/root/a", name: "a", children: [afterNewLink])
+        let afterShared = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 0,
+            unduplicatedAllocatedSize: 100,
+            fileIdentity: identity,
+            linkCount: 2
+        )
+        let afterRoot = makeTestDirectoryNode(
+            id: "/root",
+            name: "root",
+            children: [afterFolder, afterShared]
+        )
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterFolder, afterShared],
+                afterFolder.id: [afterNewLink],
+            ])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(comparison.rows.count == 1)
+        #expect(comparison.rows[0].relativePath == "a")
+        #expect(comparison.rows[0].kind == .added)
+        #expect(comparison.rows[0].afterAllocatedSize == 0)
+        #expect(comparison.rows[0].allocatedDelta == 0)
+        #expect(!(comparison.rows.contains { $0.relativePath == "z.bin" }))
+        #expect(comparison.summary.allocatedDelta == 0)
+    }
+
+    @Test
+    func testNewCloneDoesNotMoveSharedAllocationFromExistingFile() async throws {
+        let cloneIdentity = CloneIdentity(device: 1, cloneID: 42)
+        let sourceIdentity = FileIdentity(device: 1, inode: 100)
+        let beforeSource = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 120,
+            unduplicatedAllocatedSize: 120,
+            dataAllocatedSize: 100,
+            fileIdentity: sourceIdentity
+        )
+        let afterClone = makeTestFileNode(
+            id: "/root/a.bin",
+            name: "a.bin",
+            size: 110,
+            unduplicatedAllocatedSize: 110,
+            dataAllocatedSize: 100,
+            fileIdentity: FileIdentity(device: 1, inode: 200),
+            cloneIdentity: cloneIdentity
+        )
+        let afterSource = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 20,
+            unduplicatedAllocatedSize: 120,
+            dataAllocatedSize: 100,
+            fileIdentity: sourceIdentity,
+            cloneIdentity: cloneIdentity
+        )
+
+        let comparison = try await ScanComparisonService().compare(
+            before: cloneSnapshot([beforeSource]),
+            after: cloneSnapshot([afterClone, afterSource])
+        )
+
+        #expect(comparison.rows.map(\.relativePath) == ["a.bin"])
+        #expect(comparison.rows[0].kind == .added)
+        #expect(comparison.rows[0].afterAllocatedSize == 10)
+        #expect(comparison.summary.allocatedDelta == 10)
+        #expect(comparison.summary.grossIncreasedAllocatedSize == 10)
+        #expect(comparison.summary.grossReclaimedAllocatedSize == 0)
+    }
+
+    @Test
+    func testNewCloneKeepsAllocationWithRenamedSource() async throws {
+        let cloneIdentity = CloneIdentity(device: 1, cloneID: 42)
+        let sourceIdentity = FileIdentity(device: 1, inode: 100)
+        let beforeSource = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 120,
+            unduplicatedAllocatedSize: 120,
+            dataAllocatedSize: 100,
+            fileIdentity: sourceIdentity
+        )
+        let afterClone = makeTestFileNode(
+            id: "/root/a.bin",
+            name: "a.bin",
+            size: 110,
+            unduplicatedAllocatedSize: 110,
+            dataAllocatedSize: 100,
+            fileIdentity: FileIdentity(device: 1, inode: 200),
+            cloneIdentity: cloneIdentity
+        )
+        let afterSource = makeTestFileNode(
+            id: "/root/y.bin",
+            name: "y.bin",
+            size: 20,
+            unduplicatedAllocatedSize: 120,
+            dataAllocatedSize: 100,
+            fileIdentity: sourceIdentity,
+            cloneIdentity: cloneIdentity
+        )
+
+        let comparison = try await ScanComparisonService().compare(
+            before: cloneSnapshot([beforeSource]),
+            after: cloneSnapshot([afterClone, afterSource])
+        )
+
+        let added = try #require(comparison.rows.first { $0.relativePath == "a.bin" })
+        let moved = try #require(comparison.rows.first { $0.relativePath == "y.bin" })
+        #expect(added.afterAllocatedSize == 10)
+        #expect(moved.kind == .moved)
+        #expect(moved.beforeAllocatedSize == 120)
+        #expect(moved.afterAllocatedSize == 120)
+        #expect(comparison.summary.allocatedDelta == 10)
+        #expect(comparison.summary.grossIncreasedAllocatedSize == 10)
+        #expect(comparison.summary.grossReclaimedAllocatedSize == 0)
+    }
+
+    @Test
+    func testRemovingCloneOwnerDoesNotGrowRemainingFile() async throws {
+        let cloneIdentity = CloneIdentity(device: 1, cloneID: 42)
+        let remainingIdentity = FileIdentity(device: 1, inode: 200)
+        let beforeOwner = makeTestFileNode(
+            id: "/root/a.bin",
+            name: "a.bin",
+            size: 100,
+            unduplicatedAllocatedSize: 100,
+            fileIdentity: FileIdentity(device: 1, inode: 100),
+            cloneIdentity: cloneIdentity
+        )
+        let beforeRemaining = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 0,
+            unduplicatedAllocatedSize: 100,
+            fileIdentity: remainingIdentity,
+            cloneIdentity: cloneIdentity
+        )
+        let afterRemaining = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 100,
+            unduplicatedAllocatedSize: 100,
+            fileIdentity: remainingIdentity
+        )
+
+        let comparison = try await ScanComparisonService().compare(
+            before: cloneSnapshot([beforeOwner, beforeRemaining]),
+            after: cloneSnapshot([afterRemaining])
+        )
+
+        #expect(comparison.rows.map(\.relativePath) == ["a.bin"])
+        #expect(comparison.rows[0].kind == .removed)
+        #expect(comparison.rows[0].beforeAllocatedSize == 0)
+        #expect(comparison.summary.allocatedDelta == 0)
+    }
+
+    @Test
+    func testRemovingCloneOwnerReportsOnlyItsUniqueResourceForkAllocation() async throws {
+        let cloneIdentity = CloneIdentity(device: 1, cloneID: 42)
+        let remainingIdentity = FileIdentity(device: 1, inode: 200)
+        let beforeOwner = makeTestFileNode(
+            id: "/root/a.bin",
+            name: "a.bin",
+            size: 110,
+            unduplicatedAllocatedSize: 110,
+            dataAllocatedSize: 100,
+            fileIdentity: FileIdentity(device: 1, inode: 100),
+            cloneIdentity: cloneIdentity
+        )
+        let beforeRemaining = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 0,
+            unduplicatedAllocatedSize: 100,
+            dataAllocatedSize: 100,
+            fileIdentity: remainingIdentity,
+            cloneIdentity: cloneIdentity
+        )
+        let afterRemaining = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 100,
+            unduplicatedAllocatedSize: 100,
+            dataAllocatedSize: 100,
+            fileIdentity: remainingIdentity
+        )
+
+        let comparison = try await ScanComparisonService().compare(
+            before: cloneSnapshot([beforeOwner, beforeRemaining]),
+            after: cloneSnapshot([afterRemaining])
+        )
+
+        #expect(comparison.rows.map(\.relativePath) == ["a.bin"])
+        #expect(comparison.rows[0].beforeAllocatedSize == 10)
+        #expect(comparison.rows[0].allocatedDelta == -10)
+        #expect(comparison.summary.allocatedDelta == -10)
+        #expect(comparison.summary.grossReclaimedAllocatedSize == 10)
+    }
+
+    @Test
+    func testIncompleteCloneGroupDoesNotInventAllocationDuringNormalization() async throws {
+        let sourceIdentity = FileIdentity(device: 1, inode: 100)
+        let cloneIdentity = CloneIdentity(device: 1, cloneID: 42)
+        let beforeOpaqueOwner = makeTestSummarizedDirectoryNode(
+            id: "/root/a-cache",
+            name: "a-cache",
+            size: 0
+        )
+        let beforeSource = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 100,
+            unduplicatedAllocatedSize: 100,
+            fileIdentity: sourceIdentity
+        )
+        let afterOpaqueOwner = makeTestSummarizedDirectoryNode(
+            id: "/root/a-cache",
+            name: "a-cache",
+            size: 100
+        )
+        let afterSource = makeTestFileNode(
+            id: "/root/z.bin",
+            name: "z.bin",
+            size: 0,
+            unduplicatedAllocatedSize: 100,
+            fileIdentity: sourceIdentity,
+            cloneIdentity: cloneIdentity
+        )
+
+        let comparison = try await ScanComparisonService().compare(
+            before: cloneSnapshot([beforeOpaqueOwner, beforeSource]),
+            after: cloneSnapshot([afterOpaqueOwner, afterSource])
+        )
+        let allocatedDeltaByPath = Dictionary(
+            uniqueKeysWithValues: comparison.rows.map { ($0.relativePath, $0.allocatedDelta) }
+        )
+
+        #expect(allocatedDeltaByPath == ["a-cache": 100, "z.bin": -100])
+        #expect(comparison.summary.allocatedDelta == 0)
+        #expect(comparison.summary.attributedAllocatedDelta == 0)
+    }
+
+    @Test
+    func testDivergedCloneMembersAreNotKeptAsFullClones() async throws {
+        let cloneIdentity = CloneIdentity(device: 1, cloneID: 42)
+        let firstIdentity = FileIdentity(device: 1, inode: 100)
+        let secondIdentity = FileIdentity(device: 1, inode: 200)
+        let beforeFiles = [
+            makeTestFileNode(
+                id: "/root/a.bin",
+                name: "a.bin",
+                size: 100,
+                unduplicatedAllocatedSize: 100,
+                fileIdentity: firstIdentity,
+                cloneIdentity: cloneIdentity
+            ),
+            makeTestFileNode(
+                id: "/root/z.bin",
+                name: "z.bin",
+                size: 0,
+                unduplicatedAllocatedSize: 100,
+                fileIdentity: secondIdentity,
+                cloneIdentity: cloneIdentity
+            ),
+        ]
+        let afterFiles = [
+            makeTestFileNode(
+                id: "/root/a.bin",
+                name: "a.bin",
+                size: 100,
+                unduplicatedAllocatedSize: 100,
+                fileIdentity: firstIdentity
+            ),
+            makeTestFileNode(
+                id: "/root/z.bin",
+                name: "z.bin",
+                size: 100,
+                unduplicatedAllocatedSize: 100,
+                fileIdentity: secondIdentity
+            ),
+        ]
+
+        let comparison = try await ScanComparisonService().compare(
+            before: cloneSnapshot(beforeFiles),
+            after: cloneSnapshot(afterFiles)
+        )
+
+        #expect(comparison.rows.map(\.relativePath) == ["z.bin"])
+        #expect(comparison.rows[0].allocatedDelta == 100)
+        #expect(comparison.summary.allocatedDelta == 100)
+    }
+
+    @Test
+    func testMultipleHardLinkGroupsKeepSparseAncestorAdjustmentsBalanced() async throws {
+        let firstIdentity = FileIdentity(device: 1, inode: 101)
+        let secondIdentity = FileIdentity(device: 1, inode: 202)
+
+        func hardLink(
+            root: String,
+            name: String,
+            size: Int64,
+            unduplicatedSize: Int64,
+            identity: FileIdentity
+        ) -> FileNodeRecord {
+            makeTestFileNode(
+                id: "\(root)/folder/\(name)",
+                name: name,
+                size: size,
+                unduplicatedAllocatedSize: unduplicatedSize,
+                fileIdentity: identity,
+                linkCount: 2
+            )
+        }
+
+        let beforeFiles = [
+            hardLink(root: "/root", name: "a-one", size: 0, unduplicatedSize: 100, identity: firstIdentity),
+            hardLink(root: "/root", name: "z-one", size: 100, unduplicatedSize: 100, identity: firstIdentity),
+            hardLink(root: "/root", name: "a-two", size: 0, unduplicatedSize: 200, identity: secondIdentity),
+            hardLink(root: "/root", name: "z-two", size: 200, unduplicatedSize: 200, identity: secondIdentity),
+        ]
+        let beforeFolder = makeTestDirectoryNode(id: "/root/folder", name: "folder", children: beforeFiles)
+        let beforeRoot = makeTestDirectoryNode(id: "/root", name: "root", children: [beforeFolder])
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforeFolder],
+                beforeFolder.id: beforeFiles,
+            ])
+
+        let afterFiles = [
+            hardLink(root: "/root", name: "a-one", size: 100, unduplicatedSize: 100, identity: firstIdentity),
+            hardLink(root: "/root", name: "z-one", size: 0, unduplicatedSize: 100, identity: firstIdentity),
+            hardLink(root: "/root", name: "a-two", size: 200, unduplicatedSize: 200, identity: secondIdentity),
+            hardLink(root: "/root", name: "z-two", size: 0, unduplicatedSize: 200, identity: secondIdentity),
+        ]
+        let afterFolder = makeTestDirectoryNode(id: "/root/folder", name: "folder", children: afterFiles)
+        let afterRoot = makeTestDirectoryNode(id: "/root", name: "root", children: [afterFolder])
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterFolder],
+                afterFolder.id: afterFiles,
+            ])
+
+        let comparison = try await ScanComparisonService().compare(
+            before: makeTestSnapshot(root: beforeRoot, store: beforeStore),
+            after: makeTestSnapshot(root: afterRoot, store: afterStore)
+        )
+
+        #expect(comparison.rows.isEmpty)
+        #expect(comparison.summary.allocatedDelta == 0)
+        #expect(comparison.summary.attributedAllocatedDelta == 0)
+    }
+
+    @Test
+    func testUnambiguousFileIdentityMoveIsReportedAtDestination() async throws {
+        let identity = FileIdentity(device: 1, inode: 900)
+        let beforeFile = makeTestFileNode(
+            id: "/scan/Documents/old-name.bin",
+            name: "old-name.bin",
+            size: 64,
+            fileIdentity: identity
+        )
+        let beforeDocuments = makeTestDirectoryNode(
+            id: "/scan/Documents",
+            name: "Documents",
+            children: [beforeFile]
+        )
+        let beforeRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [beforeDocuments]
+        )
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforeDocuments],
+                beforeDocuments.id: [beforeFile],
+            ])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterFile = makeTestFileNode(
+            id: "/scan/Documents/new-name.bin",
+            name: "new-name.bin",
+            size: 64,
+            fileIdentity: identity
+        )
+        let afterDocuments = makeTestDirectoryNode(
+            id: "/scan/Documents",
+            name: "Documents",
+            children: [afterFile]
+        )
+        let afterRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [afterDocuments]
+        )
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterDocuments],
+                afterDocuments.id: [afterFile],
+            ])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(comparison.rows.count == 1)
+        let row = try #require(comparison.rows.first)
+        #expect(row.kind == .moved)
+        #expect(row.relativePath == "Documents/new-name.bin")
+        #expect(row.movedFromRelativePath == "Documents/old-name.bin")
+        #expect(row.allocatedDelta == 0)
+        #expect(comparison.summary.addedCount == 0)
+        #expect(comparison.summary.removedCount == 0)
+        #expect(comparison.summary.movedCount == 1)
+
+        #expect(comparison.topLevelChanges.count == 1)
+        let location = try #require(comparison.topLevelChanges.first)
+        #expect(location.relativePath == "Documents")
+        #expect(location.movedCount == 1)
+        #expect(location.representativeRelativePath == "Documents/new-name.bin")
+        #expect(location.afterNode?.id == "/scan/Documents")
+
+        let movedProjection = comparison.changeTree.significantProjection(changeKinds: [.moved])
+        #expect(movedProjection.roots.map(\.relativePath) == ["Documents"])
+        let allActivityProjection = comparison.changeTree.significantProjection(
+            changeKinds: Set(ScanComparisonChangeKind.allCases)
+        )
+        #expect(allActivityProjection.roots.map(\.relativePath) == ["Documents"])
+    }
+
+    @Test
+    func testLegacyResourceIdentityMatchesBulkIdentityForMoveOnSameVolume() async throws {
+        let volumeToken: UInt64 = 0xA11CE
+        let fileID: UInt64 = 900
+        let rootIdentity = resourceIdentity(fileID: 1, volumeToken: volumeToken)
+        let beforeFile = makeTestFileNode(
+            id: "/scan/old-name.bin",
+            name: "old-name.bin",
+            size: 64,
+            fileIdentity: resourceIdentity(fileID: fileID, volumeToken: volumeToken)
+        )
+        let beforeRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [beforeFile],
+            fileIdentity: rootIdentity
+        )
+        let beforeSnapshot = makeTestSnapshot(
+            root: beforeRoot,
+            store: FileTreeStore(root: beforeRoot, childrenByID: [beforeRoot.id: [beforeFile]])
+        )
+
+        let afterFile = makeTestFileNode(
+            id: "/scan/new-name.bin",
+            name: "new-name.bin",
+            size: 64,
+            fileIdentity: FileIdentity(device: 99, inode: fileID)
+        )
+        let afterRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [afterFile],
+            fileIdentity: FileIdentity(device: 99, inode: 1, volumeToken: volumeToken)
+        )
+        let afterSnapshot = makeTestSnapshot(
+            root: afterRoot,
+            store: FileTreeStore(root: afterRoot, childrenByID: [afterRoot.id: [afterFile]])
+        )
+
+        let comparison = try await ScanComparisonService().compare(
+            before: beforeSnapshot,
+            after: afterSnapshot
+        )
+
+        #expect(comparison.rows.map(\.kind) == [.moved])
+        #expect(comparison.rows.first?.movedFromRelativePath == "old-name.bin")
+        #expect(comparison.rows.first?.relativePath == "new-name.bin")
+    }
+
+    @Test
+    func testLegacyRenameMatchesCurrentScanAndArchive() async throws {
+        let directoryURL = try makeTemporaryDirectory().resolvingSymlinksInPath()
+        defer { try? FileManager.default.removeItem(at: directoryURL) }
+        let oldURL = directoryURL.appending(path: "old.bin")
+        let newURL = directoryURL.appending(path: "new.bin")
+        try Data(repeating: 1, count: 4_096).write(to: oldURL)
+
+        let loader = ScanMetadataLoader()
+        let rootValues = try directoryURL.resourceValues(forKeys: [.isDirectoryKey, .fileResourceIdentifierKey])
+        let legacyRootIdentity = loader.atomicSummaryMetadata(
+            for: directoryURL, prefetchedResourceValues: rootValues
+        ).fileIdentity
+        let legacyMetadata = try loader.metadata(for: oldURL)
+        guard case .resourceIdentifier = legacyRootIdentity,
+            case .resourceIdentifier = legacyMetadata.fileIdentity
+        else {
+            Issue.record("Expected legacy Foundation resource identities")
+            return
+        }
+        let file = makeTestFileNode(
+            id: oldURL.path, name: "old.bin", size: legacyMetadata.allocatedSize,
+            fileIdentity: legacyMetadata.fileIdentity
+        )
+        let root = makeTestDirectoryNode(
+            id: directoryURL.path, name: "root", children: [file], fileIdentity: legacyRootIdentity
+        )
+        let before = makeTestSnapshot(root: root, store: FileTreeStore(root: root, childrenByID: [root.id: [file]]))
+        try FileManager.default.moveItem(at: oldURL, to: newURL)
+
+        var scanned: ScanSnapshot?
+        for try await event in ScanEngine().scan(target: ScanTarget(url: directoryURL), options: ScanOptions()) {
+            if case .finished(let snapshot) = event { scanned = snapshot }
+        }
+        let after = try #require(scanned)
+        #expect(after.root.fileIdentity?.isFileSystemIdentity == true)
+        #expect(after.root.fileIdentity?.darwinIdentity == legacyRootIdentity?.darwinIdentity)
+        let archivesURL = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: archivesURL) }
+        var afterSnapshots = [after]
+        for version in [4, 5] {
+            let archiveURL = archivesURL.appending(path: "v\(version).radixscan")
+            let service = ScanArchiveService()
+            _ = try await service.export(
+                snapshot: after, to: archiveURL, options: ScanArchiveExportOptions(formatVersion: version)
+            )
+            let imported = try await service.importSnapshot(from: archiveURL).snapshot
+            #expect(imported.root.fileIdentity?.darwinIdentity == after.root.fileIdentity?.darwinIdentity)
+            afterSnapshots.append(imported)
+        }
+        for after in afterSnapshots {
+            for (earlier, later) in [(before, after), (after, before)] {
+                let comparison = try await ScanComparisonService().compare(before: earlier, after: later)
+                #expect(comparison.rows.map(\.kind) == [.moved])
+                #expect(comparison.summary.grossIncreasedAllocatedSize == 0)
+                #expect(comparison.summary.grossReclaimedAllocatedSize == 0)
+            }
+        }
+    }
+
+    @Test
+    func testMoveVolumeIdentityBridgingIsDeviceScopedAndUnambiguous() async throws {
+        func snapshot(rootPath: String, name: String, fileIdentity: FileIdentity, rootIdentity: FileIdentity)
+            -> ScanSnapshot
+        {
+            let file = makeTestFileNode(id: rootPath + "/" + name, name: name, size: 64, fileIdentity: fileIdentity)
+            let root = makeTestDirectoryNode(id: rootPath, name: "scan", children: [file], fileIdentity: rootIdentity)
+            return makeTestSnapshot(root: root, store: FileTreeStore(root: root, childrenByID: [root.id: [file]]))
+        }
+        let native = FileIdentity(device: 99, inode: 900)
+        let rootWithoutToken = FileIdentity(device: 99, inode: 1)
+        let rootWithToken = FileIdentity(device: 99, inode: 1, volumeToken: 10)
+        let cases: [(FileIdentity, FileIdentity, FileIdentity, FileIdentity, Bool)] = [
+            // An older native archive can use a token recorded on the same device in the other scan.
+            (native, rootWithoutToken, native, rootWithToken, true),
+            // A root token cannot identify files on another volume with a coincidentally equal inode.
+            (
+                resourceIdentity(fileID: 900, volumeToken: 10), resourceIdentity(fileID: 1, volumeToken: 10),
+                FileIdentity(device: 100, inode: 900), rootWithToken, false
+            ),
+            // Reused device numbers with conflicting recorded volume identities are ambiguous.
+            (native, rootWithToken, native, FileIdentity(device: 99, inode: 1, volumeToken: 20), false),
+            // A token from another scan does not identify an otherwise unknown native volume.
+            (
+                native, FileIdentity(device: 100, inode: 1, volumeToken: 20),
+                resourceIdentity(fileID: 900, volumeToken: 10), rootWithToken, false
+            ),
+            // Device reuse elsewhere must not invalidate a token known in the file's own scan.
+            (
+                resourceIdentity(fileID: 900, volumeToken: 10),
+                FileIdentity(device: 99, inode: 1, volumeToken: 20), native, rootWithToken, true
+            ),
+            // The volume token survives reassignment of its device number.
+            (
+                native, rootWithToken, FileIdentity(device: 100, inode: 900),
+                FileIdentity(device: 100, inode: 1, volumeToken: 10), true
+            ),
+            // Neither matching devices on different volumes nor matching inodes suffice.
+            (
+                native, rootWithToken, FileIdentity(device: 100, inode: 900),
+                FileIdentity(device: 100, inode: 1, volumeToken: 20), false
+            ),
+            (native, rootWithToken, FileIdentity(device: 99, inode: 901), rootWithToken, false),
+            // Native archives without supplementary tokens retain exact identity matching.
+            (native, rootWithoutToken, native, rootWithoutToken, true),
+        ]
+        for (index, entry) in cases.enumerated() {
+            let (beforeFile, beforeRoot, afterFile, afterRoot, moved) = entry
+            for afterRootPath in ["/scan", "/other-scan"] {
+                let before = snapshot(
+                    rootPath: "/scan", name: "old", fileIdentity: beforeFile, rootIdentity: beforeRoot)
+                let after = snapshot(
+                    rootPath: afterRootPath, name: "new", fileIdentity: afterFile, rootIdentity: afterRoot)
+                for (earlier, later) in [(before, after), (after, before)] {
+                    let comparison = try await ScanComparisonService().compare(before: earlier, after: later)
+                    #expect(comparison.summary.movedCount == (moved ? 1 : 0), "Case \(index)")
+                    #expect(comparison.rows.count == (moved ? 1 : 2), "Case \(index)")
+                }
+            }
+        }
+    }
+
+    @Test
+    func testMovesUseContainingVolumesWhenDeviceNumbersSwap() async throws {
+        func snapshot(rootPath: String, renamed: Bool) -> ScanSnapshot {
+            var folders: [FileNodeRecord] = []
+            var childrenByID: [String: [FileNodeRecord]] = [:]
+            for (name, token, device) in [("a", UInt64(10), UInt64(100)), ("b", 20, 200)] {
+                let currentDevice = renamed ? 300 - device : device
+                let folderPath = rootPath + "/" + name
+                let fileName = renamed ? "new" : "old"
+                let file = makeTestFileNode(
+                    id: folderPath + "/" + fileName, name: fileName, size: 64,
+                    fileIdentity: FileIdentity(device: currentDevice, inode: 900)
+                )
+                let folder = makeTestDirectoryNode(
+                    id: folderPath, name: name, children: [file],
+                    fileIdentity: FileIdentity(device: currentDevice, inode: 1, volumeToken: token)
+                )
+                folders.append(folder)
+                childrenByID[folderPath] = [file]
+            }
+            let root = makeTestDirectoryNode(
+                id: rootPath, name: "scan", children: folders,
+                fileIdentity: FileIdentity(device: 1, inode: 1, volumeToken: 1)
+            )
+            childrenByID[rootPath] = folders
+            return makeTestSnapshot(root: root, store: FileTreeStore(root: root, childrenByID: childrenByID))
+        }
+        for rootPath in ["/scan", "/other-scan"] {
+            let before = snapshot(rootPath: "/scan", renamed: false)
+            let after = snapshot(rootPath: rootPath, renamed: true)
+            for (earlier, later) in [(before, after), (after, before)] {
+                let comparison = try await ScanComparisonService().compare(before: earlier, after: later)
+                #expect(comparison.rows.map(\.kind) == [.moved, .moved])
+                #expect(comparison.summary.grossIncreasedAllocatedSize == 0)
+                #expect(comparison.summary.grossReclaimedAllocatedSize == 0)
+                for row in comparison.rows {
+                    #expect(
+                        row.movedFromRelativePath?.split(separator: "/").first
+                            == row.relativePath.split(separator: "/").first)
+                }
+            }
+        }
+    }
+
+    @Test
+    func testAmbiguousFileIdentityDoesNotInferMove() async throws {
+        let identity = FileIdentity(device: 1, inode: 901)
+        let beforeFirst = makeTestFileNode(
+            id: "/scan/Documents/first.bin",
+            name: "first.bin",
+            size: 10,
+            fileIdentity: identity
+        )
+        let beforeSecond = makeTestFileNode(
+            id: "/scan/Documents/second.bin",
+            name: "second.bin",
+            size: 10,
+            fileIdentity: identity
+        )
+        let beforeDocuments = makeTestDirectoryNode(
+            id: "/scan/Documents",
+            name: "Documents",
+            children: [beforeFirst, beforeSecond]
+        )
+        let beforeRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [beforeDocuments]
+        )
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforeDocuments],
+                beforeDocuments.id: [beforeFirst, beforeSecond],
+            ])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterFile = makeTestFileNode(
+            id: "/scan/Documents/renamed.bin",
+            name: "renamed.bin",
+            size: 10,
+            fileIdentity: identity
+        )
+        let afterDocuments = makeTestDirectoryNode(
+            id: "/scan/Documents",
+            name: "Documents",
+            children: [afterFile]
+        )
+        let afterRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [afterDocuments]
+        )
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterDocuments],
+                afterDocuments.id: [afterFile],
+            ])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(!(comparison.rows.contains { $0.kind == .moved }))
+        #expect(comparison.summary.addedCount == 1)
+        #expect(comparison.summary.removedCount == 2)
+        #expect(comparison.summary.movedCount == 0)
+    }
+
+    @Test
+    func testTopLevelChangesPartitionFinalRowsAndReportGrossSpaceChanges() async throws {
+        let beforeLibraryFile = makeTestFileNode(
+            id: "/scan/Library/cache.bin",
+            name: "cache.bin",
+            size: 10
+        )
+        let beforeDownloadsFile = makeTestFileNode(
+            id: "/scan/Downloads/old.bin",
+            name: "old.bin",
+            size: 20
+        )
+        let beforeLibrary = makeTestDirectoryNode(
+            id: "/scan/Library",
+            name: "Library",
+            children: [beforeLibraryFile]
+        )
+        let beforeDownloads = makeTestDirectoryNode(
+            id: "/scan/Downloads",
+            name: "Downloads",
+            children: [beforeDownloadsFile]
+        )
+        let beforeWork = makeTestDirectoryNode(id: "/scan/Work", name: "Work", children: [])
+        let beforeRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [beforeLibrary, beforeDownloads, beforeWork]
+        )
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforeLibrary, beforeDownloads, beforeWork],
+                beforeLibrary.id: [beforeLibraryFile],
+                beforeDownloads.id: [beforeDownloadsFile],
+                beforeWork.id: [],
+            ])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterLibraryFile = makeTestFileNode(
+            id: "/scan/Library/cache.bin",
+            name: "cache.bin",
+            size: 30
+        )
+        let afterWorkFile = makeTestFileNode(
+            id: "/scan/Work/new.bin",
+            name: "new.bin",
+            size: 40
+        )
+        let afterLibrary = makeTestDirectoryNode(
+            id: "/scan/Library",
+            name: "Library",
+            children: [afterLibraryFile]
+        )
+        let afterDownloads = makeTestDirectoryNode(id: "/scan/Downloads", name: "Downloads", children: [])
+        let afterWork = makeTestDirectoryNode(
+            id: "/scan/Work",
+            name: "Work",
+            children: [afterWorkFile]
+        )
+        let afterRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [afterLibrary, afterDownloads, afterWork]
+        )
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterLibrary, afterDownloads, afterWork],
+                afterLibrary.id: [afterLibraryFile],
+                afterDownloads.id: [],
+                afterWork.id: [afterWorkFile],
+            ])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(comparison.topLevelChanges.map(\.relativePath) == ["Work", "Downloads", "Library"])
+        #expect(comparison.topLevelChanges.map(\.allocatedDelta) == [40, -20, 20])
+        #expect(comparison.topLevelChanges[0].addedCount == 1)
+        #expect(comparison.topLevelChanges[1].removedCount == 1)
+        #expect(comparison.topLevelChanges[2].grewCount == 1)
+        #expect(comparison.topLevelChanges.reduce(0) { $0 + $1.allocatedDelta } == 40)
+        #expect(comparison.topLevelChanges.reduce(0) { $0 + $1.affectedCount } == 3)
+        #expect(comparison.summary.grossIncreasedAllocatedSize == 60)
+        #expect(comparison.summary.grossReclaimedAllocatedSize == 20)
+        #expect(comparison.summary.attributedAllocatedDelta == 40)
+        #expect(comparison.summary.allocatedDelta == 40)
+    }
+
+    @Test
+    func testWarningsSuppressUncertainAddedAndRemovedRows() async throws {
+        let beforePrivateFile = makeTestFileNode(
+            id: "/scan/Private/old.bin",
+            name: "old.bin",
+            size: 100
+        )
+        let beforePrivate = makeTestDirectoryNode(
+            id: "/scan/Private",
+            name: "Private",
+            children: [beforePrivateFile]
+        )
+        let beforeRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [beforePrivate]
+        )
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforePrivate],
+                beforePrivate.id: [beforePrivateFile],
+            ])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let afterEmptyRoot = makeTestDirectoryNode(id: "/scan", name: "scan", children: [])
+        let afterEmptyStore = FileTreeStore(root: afterEmptyRoot, childrenByID: [afterEmptyRoot.id: []])
+        let afterWarning = ScanWarning(
+            path: "/scan/Private",
+            message: "Permission denied",
+            category: .permissionDenied
+        )
+        let afterWithWarning = makeTestSnapshot(
+            root: afterEmptyRoot,
+            store: afterEmptyStore,
+            warnings: [afterWarning]
+        )
+
+        let removalComparison = try await ScanComparisonService().compare(
+            before: beforeSnapshot,
+            after: afterWithWarning
+        )
+
+        #expect(removalComparison.rows.isEmpty)
+        #expect(removalComparison.summary.removedCount == 0)
+        #expect(removalComparison.summary.grossReclaimedAllocatedSize == 0)
+        #expect(removalComparison.summary.allocatedDelta == -100)
+        #expect(removalComparison.summary.attributedAllocatedDelta == 0)
+        #expect(removalComparison.coverage.issues.contains(.afterWarnings(1)))
+
+        let beforeWarning = ScanWarning(
+            path: "/scan/Private",
+            message: "Permission denied",
+            category: .permissionDenied
+        )
+        let beforeEmptyRoot = makeTestDirectoryNode(id: "/scan", name: "scan", children: [])
+        let beforeEmptyStore = FileTreeStore(root: beforeEmptyRoot, childrenByID: [beforeEmptyRoot.id: []])
+        let beforeWithWarning = makeTestSnapshot(
+            root: beforeEmptyRoot,
+            store: beforeEmptyStore,
+            warnings: [beforeWarning]
+        )
+
+        let additionComparison = try await ScanComparisonService().compare(
+            before: beforeWithWarning,
+            after: beforeSnapshot
+        )
+
+        #expect(additionComparison.rows.isEmpty)
+        #expect(additionComparison.summary.addedCount == 0)
+        #expect(additionComparison.summary.grossIncreasedAllocatedSize == 0)
+        #expect(additionComparison.summary.allocatedDelta == 100)
+        #expect(additionComparison.summary.attributedAllocatedDelta == 0)
+        #expect(additionComparison.coverage.issues.contains(.beforeWarnings(1)))
+    }
+
+    @Test
+    func testAccessChangesSuppressSizeRowsButKeepReadableSiblingChanges() async throws {
+        func snapshot(rootPath: String, blocked: Bool, warningPath: String = "private") -> ScanSnapshot {
+            let child = makeTestFileNode(id: rootPath + "/private/child", name: "child", size: 100)
+            let directory = makeTestDirectoryNode(
+                id: rootPath + "/private", name: "private",
+                children: blocked ? [] : [child], isAccessible: !blocked
+            )
+            let sibling = makeTestFileNode(
+                id: rootPath + "/privateer", name: "privateer", size: blocked ? 20 : 10
+            )
+            let root = makeTestDirectoryNode(id: rootPath, name: "root", children: [directory, sibling])
+            let store = FileTreeStore(
+                root: root,
+                childrenByID: [
+                    root.id: [directory, sibling], directory.id: blocked ? [] : [child],
+                ])
+            return makeTestSnapshot(
+                root: root, store: store,
+                warnings: blocked
+                    ? [
+                        ScanWarning(
+                            path: warningPath.isEmpty ? rootPath : rootPath + "/" + warningPath,
+                            message: "Permission denied", category: .permissionDenied
+                        )
+                    ] : []
+            )
+        }
+
+        for afterRoot in ["/root", "/other-root"] {
+            let readable = snapshot(rootPath: "/root", blocked: false)
+            for warningPath in ["private", "private/child", ""] {
+                let blocked = snapshot(rootPath: afterRoot, blocked: true, warningPath: warningPath)
+                let expectedPaths = warningPath.isEmpty ? [] : ["privateer"]
+                let expectedDelta: Int64 = warningPath.isEmpty ? 0 : 10
+                for (before, after, delta) in [(readable, blocked, expectedDelta), (blocked, readable, -expectedDelta)]
+                {
+                    let comparison = try await ScanComparisonService().compare(before: before, after: after)
+                    #expect(comparison.rows.map(\.relativePath) == expectedPaths)
+                    #expect(comparison.summary.attributedAllocatedDelta == delta)
+                    #expect(comparison.summary.grossIncreasedAllocatedSize == max(delta, 0))
+                    #expect(comparison.summary.grossReclaimedAllocatedSize == max(-delta, 0))
+                }
+            }
+        }
+    }
+
+    @Test
+    func testWarningBoundaryIndexHandlesAncestorsDescendantsAndSiblingPrefixes() async throws {
+        let emptyRoot = makeTestDirectoryNode(id: "/scan", name: "scan", children: [])
+        let emptyStore = FileTreeStore(root: emptyRoot, childrenByID: [emptyRoot.id: []])
+        let descendantWarning = ScanWarning(
+            path: "/scan/Private/blocked",
+            message: "Permission denied",
+            category: .permissionDenied
+        )
+        let before = makeTestSnapshot(
+            root: emptyRoot,
+            store: emptyStore,
+            warnings: [descendantWarning]
+        )
+
+        let privateFile = makeTestFileNode(
+            id: "/scan/Private/new.bin",
+            name: "new.bin",
+            size: 100
+        )
+        let privateFolder = makeTestDirectoryNode(
+            id: "/scan/Private",
+            name: "Private",
+            children: [privateFile]
+        )
+        let siblingPrefix = makeTestFileNode(
+            id: "/scan/Privateer.bin",
+            name: "Privateer.bin",
+            size: 50
+        )
+        let afterRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [privateFolder, siblingPrefix]
+        )
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [privateFolder, siblingPrefix],
+                privateFolder.id: [privateFile],
+            ])
+
+        let descendantComparison = try await ScanComparisonService().compare(
+            before: before,
+            after: makeTestSnapshot(root: afterRoot, store: afterStore)
+        )
+
+        #expect(descendantComparison.rows.map(\.relativePath) == ["Privateer.bin"])
+
+        let beforePublic = makeTestDirectoryNode(id: "/scan/Public", name: "Public", children: [])
+        let beforePublicRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [beforePublic]
+        )
+        let beforePublicStore = FileTreeStore(
+            root: beforePublicRoot,
+            childrenByID: [
+                beforePublicRoot.id: [beforePublic],
+                beforePublic.id: [],
+            ])
+        let ancestorWarning = ScanWarning(
+            path: "/scan/Public",
+            message: "Permission denied",
+            category: .permissionDenied
+        )
+        let beforeWithAncestorWarning = makeTestSnapshot(
+            root: beforePublicRoot,
+            store: beforePublicStore,
+            warnings: [ancestorWarning]
+        )
+        let publicFile = makeTestFileNode(
+            id: "/scan/Public/new.bin",
+            name: "new.bin",
+            size: 100
+        )
+        let afterPublic = makeTestDirectoryNode(
+            id: "/scan/Public",
+            name: "Public",
+            children: [publicFile]
+        )
+        let afterPublicRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [afterPublic]
+        )
+        let afterPublicStore = FileTreeStore(
+            root: afterPublicRoot,
+            childrenByID: [
+                afterPublicRoot.id: [afterPublic],
+                afterPublic.id: [publicFile],
+            ])
+
+        let ancestorComparison = try await ScanComparisonService().compare(
+            before: beforeWithAncestorWarning,
+            after: makeTestSnapshot(root: afterPublicRoot, store: afterPublicStore)
+        )
+
+        #expect(ancestorComparison.rows.isEmpty)
+    }
+
+    @Test
+    func testCoverageIsHighForCompleteEquivalentSnapshotsWithKnownOptions() async throws {
+        let root = makeTestDirectoryNode(id: "/scan", name: "scan", children: [])
+        let store = FileTreeStore(root: root, childrenByID: [root.id: []])
+        let target = makeTestTarget("/scan")
+        let options = ScanOptions()
+        let before = ScanSnapshot(
+            target: target,
+            treeStore: store,
+            startedAt: Date(),
+            finishedAt: Date(),
+            scanWarnings: [],
+            isComplete: true,
+            scanOptions: options
+        )
+        let after = ScanSnapshot(
+            target: target,
+            treeStore: store,
+            startedAt: Date(),
+            finishedAt: Date(),
+            scanWarnings: [],
+            isComplete: true,
+            scanOptions: options
+        )
+
+        let comparison = try await ScanComparisonService().compare(before: before, after: after)
+
+        #expect(comparison.coverage.confidence == .high)
+        #expect(comparison.coverage.issues.isEmpty)
+        #expect(comparison.coverage.targetsMatch)
+        #expect(comparison.coverage.scanOptionsMatch == true)
+    }
+
+    @Test
+    func testRowQuerySortsDeltaByDisplayedSignedValue() throws {
+        let grewBefore = makeTestFileNode(id: "/before/grew.bin", name: "grew.bin", size: 10)
+        let grewAfter = makeTestFileNode(id: "/after/grew.bin", name: "grew.bin", size: 20)
+        let shrankBefore = makeTestFileNode(id: "/before/shrank.bin", name: "shrank.bin", size: 100)
+        let shrankAfter = makeTestFileNode(id: "/after/shrank.bin", name: "shrank.bin", size: 20)
+        let rows = [
+            ScanComparisonRow(
+                relativePath: "shrank.bin",
+                kind: .shrank,
+                beforeNode: shrankBefore,
+                afterNode: shrankAfter
+            ),
+            ScanComparisonRow(
+                relativePath: "grew.bin",
+                kind: .grew,
+                beforeNode: grewBefore,
+                afterNode: grewAfter
+            ),
+        ]
+        let query = ScanComparisonRowQuery(
+            searchText: "",
+            sortOrder: [ScanComparisonRowComparator(field: .allocatedDelta, order: .reverse)]
+        )
+
+        let result = try query.applying(to: rows, cancellationCheck: {})
+
+        #expect(result.map(\.relativePath) == ["grew.bin", "shrank.bin"])
+    }
+
+    @Test
+    func testRowQueryUsesSecondaryDescriptorBeforeDeterministicFallback() throws {
+        let alpha = makeTestFileNode(id: "/after/alpha.bin", name: "alpha.bin", size: 10)
+        let zeta = makeTestFileNode(id: "/after/zeta.bin", name: "zeta.bin", size: 10)
+        let rows = [
+            ScanComparisonRow(
+                relativePath: "alpha.bin",
+                kind: .added,
+                beforeNode: nil,
+                afterNode: alpha
+            ),
+            ScanComparisonRow(
+                relativePath: "zeta.bin",
+                kind: .added,
+                beforeNode: nil,
+                afterNode: zeta
+            ),
+        ]
+        let query = ScanComparisonRowQuery(
+            searchText: "",
+            sortOrder: [
+                ScanComparisonRowComparator(field: .allocatedDelta, order: .reverse),
+                ScanComparisonRowComparator(field: .relativePath, order: .reverse),
+            ]
+        )
+
+        #expect(try query.applying(to: rows, cancellationCheck: {}).map(\.relativePath) == ["zeta.bin", "alpha.bin"])
+    }
+
+    @Test
+    func testComparisonServiceUsesDeterministicFallbackForEqualImpactRows() async throws {
+        let beforeDocuments = makeTestDirectoryNode(
+            id: "/before/Documents",
+            name: "Documents",
+            children: []
+        )
+        let beforeRoot = makeTestDirectoryNode(
+            id: "/before",
+            name: "before",
+            children: [beforeDocuments]
+        )
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforeDocuments],
+                beforeDocuments.id: [],
+            ])
+        let alpha = makeTestFileNode(
+            id: "/after/Documents/alpha.bin",
+            name: "alpha.bin",
+            size: 10
+        )
+        let zeta = makeTestFileNode(
+            id: "/after/Documents/zeta.bin",
+            name: "zeta.bin",
+            size: 10
+        )
+        let afterDocuments = makeTestDirectoryNode(
+            id: "/after/Documents",
+            name: "Documents",
+            children: [alpha, zeta]
+        )
+        let afterRoot = makeTestDirectoryNode(
+            id: "/after",
+            name: "after",
+            children: [afterDocuments]
+        )
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterDocuments],
+                afterDocuments.id: [alpha, zeta],
+            ])
+
+        let comparison = try await ScanComparisonService().compare(
+            before: makeTestSnapshot(root: beforeRoot, store: beforeStore),
+            after: makeTestSnapshot(root: afterRoot, store: afterStore)
+        )
+
+        #expect(comparison.rows.map(\.relativePath) == ["Documents/alpha.bin", "Documents/zeta.bin"])
+        #expect(comparison.topLevelChanges.first?.representativeRelativePath == "Documents/alpha.bin")
+    }
+
+    @Test
+    func testRowQueryFiltersKindAndNormalizedPath() throws {
+        let addedNode = makeTestFileNode(
+            id: "/after/Library/Application Support/cache.bin",
+            name: "cache.bin",
+            size: 10
+        )
+        let removedNode = makeTestFileNode(id: "/before/other.bin", name: "other.bin", size: 20)
+        let rows = [
+            ScanComparisonRow(
+                relativePath: "Library/Application Support/cache.bin",
+                kind: .added,
+                beforeNode: nil,
+                afterNode: addedNode
+            ),
+            ScanComparisonRow(
+                relativePath: "other.bin",
+                kind: .removed,
+                beforeNode: removedNode,
+                afterNode: nil
+            ),
+        ]
+        let query = ScanComparisonRowQuery(
+            changeKinds: [.added],
+            searchText: "application support",
+            sortOrder: []
+        )
+
+        let result = try query.applying(to: rows, cancellationCheck: {})
+
+        #expect(result.map(\.relativePath) == ["Library/Application Support/cache.bin"])
+    }
+
+    @Test
+    func testRowQuerySearchIndexPreservesCaseDiacriticNameAndPathMatching() throws {
+        let cafe = makeTestFileNode(
+            id: "/after/Library/Café/cache.bin",
+            name: "résumé.bin",
+            size: 10
+        )
+        let row = ScanComparisonRow(
+            relativePath: "Library/Café/cache.bin",
+            kind: .added,
+            beforeNode: nil,
+            afterNode: cafe
+        )
+        let rows = [row]
+        let index = try ScanComparisonSearchIndex(rows: rows, cancellationCheck: {})
+
+        #expect(
+            try ScanComparisonRowQuery(searchText: "RESUME", sortOrder: [])
+                .applying(to: rows, searchIndex: index, cancellationCheck: {})
+                .map(\.id) == [row.id])
+        #expect(
+            try ScanComparisonRowQuery(searchText: "library/cafe", sortOrder: [])
+                .applying(to: rows, searchIndex: index, cancellationCheck: {})
+                .map(\.id) == [row.id])
+        #expect(
+            try ScanComparisonRowQuery(searchText: "resume\nlibrary", sortOrder: [])
+                .applying(to: rows, searchIndex: index, cancellationCheck: {})
+                .isEmpty)
+    }
+
+    @Test
+    func testRowQueryFiltersExactLocationPrefix() throws {
+        let libraryNode = makeTestFileNode(
+            id: "/after/Library/cache.bin",
+            name: "cache.bin",
+            size: 10
+        )
+        let librarySupportNode = makeTestFileNode(
+            id: "/after/Library Support/cache.bin",
+            name: "cache.bin",
+            size: 20
+        )
+        let rows = [
+            ScanComparisonRow(
+                relativePath: "Library/cache.bin",
+                kind: .added,
+                beforeNode: nil,
+                afterNode: libraryNode
+            ),
+            ScanComparisonRow(
+                relativePath: "Library Support/cache.bin",
+                kind: .added,
+                beforeNode: nil,
+                afterNode: librarySupportNode
+            ),
+        ]
+        let query = ScanComparisonRowQuery(
+            searchText: "",
+            sortOrder: [],
+            pathPrefix: "Library"
+        )
+
+        #expect(try query.applying(to: rows, cancellationCheck: {}).map(\.relativePath) == ["Library/cache.bin"])
+    }
+
+    @Test
+    func testUnchangedAndRootRowsAreExcluded() async throws {
+        let unchangedBefore = makeTestFileNode(id: "/before/unchanged.bin", name: "unchanged.bin", size: 20)
+        let beforeRoot = makeTestDirectoryNode(id: "/before", name: "before", children: [unchangedBefore])
+        let beforeStore = FileTreeStore(root: beforeRoot, childrenByID: [beforeRoot.id: [unchangedBefore]])
+        let beforeSnapshot = makeTestSnapshot(root: beforeRoot, store: beforeStore)
+
+        let unchangedAfter = makeTestFileNode(id: "/after/unchanged.bin", name: "unchanged.bin", size: 20)
+        let afterRoot = makeTestDirectoryNode(id: "/after", name: "after", children: [unchangedAfter])
+        let afterStore = FileTreeStore(root: afterRoot, childrenByID: [afterRoot.id: [unchangedAfter]])
+        let afterSnapshot = makeTestSnapshot(root: afterRoot, store: afterStore)
+
+        let comparison = try await ScanComparisonService().compare(before: beforeSnapshot, after: afterSnapshot)
+
+        #expect(comparison.rows.isEmpty)
+        #expect(comparison.summary.changedCount == 0)
+        #expect(comparison.summary.allocatedDelta == 0)
+    }
+
+    @Test
+    func testChangeTreeRollsEvidenceIntoEveryAncestorWithoutHidingChurn() async throws {
+        let beforeCache = makeTestFileNode(
+            id: "/scan/Users/colin/Library/cache.bin",
+            name: "cache.bin",
+            size: 10
+        )
+        let beforeOld = makeTestFileNode(
+            id: "/scan/Users/colin/Downloads/old.bin",
+            name: "old.bin",
+            size: 60
+        )
+        let beforeApp = makeTestFileNode(
+            id: "/scan/Applications/app.bin",
+            name: "app.bin",
+            size: 10
+        )
+        let beforeLibrary = makeTestDirectoryNode(
+            id: "/scan/Users/colin/Library",
+            name: "Library",
+            children: [beforeCache]
+        )
+        let beforeDownloads = makeTestDirectoryNode(
+            id: "/scan/Users/colin/Downloads",
+            name: "Downloads",
+            children: [beforeOld]
+        )
+        let beforeColin = makeTestDirectoryNode(
+            id: "/scan/Users/colin",
+            name: "colin",
+            children: [beforeLibrary, beforeDownloads]
+        )
+        let beforeUsers = makeTestDirectoryNode(
+            id: "/scan/Users",
+            name: "Users",
+            children: [beforeColin]
+        )
+        let beforeApplications = makeTestDirectoryNode(
+            id: "/scan/Applications",
+            name: "Applications",
+            children: [beforeApp]
+        )
+        let beforeRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [beforeUsers, beforeApplications]
+        )
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforeUsers, beforeApplications],
+                beforeUsers.id: [beforeColin],
+                beforeColin.id: [beforeLibrary, beforeDownloads],
+                beforeLibrary.id: [beforeCache],
+                beforeDownloads.id: [beforeOld],
+                beforeApplications.id: [beforeApp],
+            ])
+
+        let afterCache = makeTestFileNode(
+            id: "/scan/Users/colin/Library/cache.bin",
+            name: "cache.bin",
+            size: 110
+        )
+        let afterApp = makeTestFileNode(
+            id: "/scan/Applications/app.bin",
+            name: "app.bin",
+            size: 50
+        )
+        let afterLibrary = makeTestDirectoryNode(
+            id: "/scan/Users/colin/Library",
+            name: "Library",
+            children: [afterCache]
+        )
+        let afterDownloads = makeTestDirectoryNode(
+            id: "/scan/Users/colin/Downloads",
+            name: "Downloads",
+            children: []
+        )
+        let afterColin = makeTestDirectoryNode(
+            id: "/scan/Users/colin",
+            name: "colin",
+            children: [afterLibrary, afterDownloads]
+        )
+        let afterUsers = makeTestDirectoryNode(
+            id: "/scan/Users",
+            name: "Users",
+            children: [afterColin]
+        )
+        let afterApplications = makeTestDirectoryNode(
+            id: "/scan/Applications",
+            name: "Applications",
+            children: [afterApp]
+        )
+        let afterRoot = makeTestDirectoryNode(
+            id: "/scan",
+            name: "scan",
+            children: [afterUsers, afterApplications]
+        )
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [afterUsers, afterApplications],
+                afterUsers.id: [afterColin],
+                afterColin.id: [afterLibrary, afterDownloads],
+                afterLibrary.id: [afterCache],
+                afterDownloads.id: [],
+                afterApplications.id: [afterApp],
+            ])
+
+        let comparison = try await ScanComparisonService().compare(
+            before: makeTestSnapshot(root: beforeRoot, store: beforeStore),
+            after: makeTestSnapshot(root: afterRoot, store: afterStore)
+        )
+
+        let users = try #require(comparison.changeTree.node(at: "Users"))
+        #expect(users.increasedAllocatedSize == 100)
+        #expect(users.reclaimedAllocatedSize == 60)
+        #expect(users.allocatedDelta == 40)
+        #expect(users.affectedCount == 2)
+        #expect(users.childPaths == ["Users/colin"])
+
+        let colin = try #require(comparison.changeTree.node(at: "Users/colin"))
+        #expect(colin.increasedAllocatedSize == 100)
+        #expect(colin.reclaimedAllocatedSize == 60)
+        #expect(colin.childPaths == ["Users/colin/Library", "Users/colin/Downloads"])
+        #expect(comparison.changeTree.rootPaths == ["Users", "Applications"])
+        #expect(comparison.topLevelChanges.map(\.relativePath) == ["Users", "Applications"])
+        #expect(comparison.topLevelChanges.first?.increasedAllocatedSize == 100)
+        #expect(comparison.topLevelChanges.first?.reclaimedAllocatedSize == 60)
+        #expect(
+            comparison.changeTree.rootPaths.compactMap(comparison.changeTree.node).reduce(0) {
+                $0 + $1.increasedAllocatedSize
+            } == comparison.summary.grossIncreasedAllocatedSize)
+        #expect(
+            comparison.changeTree.rootPaths.compactMap(comparison.changeTree.node).reduce(0) {
+                $0 + $1.reclaimedAllocatedSize
+            } == comparison.summary.grossReclaimedAllocatedSize)
+    }
+
+    @Test
+    func testSignificantProjectionCoversGrowthAndReclamationIndependently() async throws {
+        let beforeNodes = [
+            makeTestFileNode(id: "/scan/growth.bin", name: "growth.bin", size: 0),
+            makeTestFileNode(id: "/scan/reclaimed.bin", name: "reclaimed.bin", size: 5),
+            makeTestFileNode(id: "/scan/tail.bin", name: "tail.bin", size: 0),
+        ]
+        let beforeRoot = makeTestDirectoryNode(id: "/scan", name: "scan", children: beforeNodes)
+        let beforeStore = FileTreeStore(root: beforeRoot, childrenByID: [beforeRoot.id: beforeNodes])
+        let afterNodes = [
+            makeTestFileNode(id: "/scan/growth.bin", name: "growth.bin", size: 95),
+            makeTestFileNode(id: "/scan/reclaimed.bin", name: "reclaimed.bin", size: 0),
+            makeTestFileNode(id: "/scan/tail.bin", name: "tail.bin", size: 5),
+        ]
+        let afterRoot = makeTestDirectoryNode(id: "/scan", name: "scan", children: afterNodes)
+        let afterStore = FileTreeStore(root: afterRoot, childrenByID: [afterRoot.id: afterNodes])
+        let comparison = try await ScanComparisonService().compare(
+            before: makeTestSnapshot(root: beforeRoot, store: beforeStore),
+            after: makeTestSnapshot(root: afterRoot, store: afterStore)
+        )
+
+        let projection = comparison.changeTree.significantProjection(
+            changeKinds: Set(ScanComparisonChangeKind.allCases),
+            coverageTarget: 0.95
+        )
+
+        #expect(projection.namedRootCount == 2)
+        #expect(projection.hiddenRootCount == 1)
+        #expect(projection.roots.contains { $0.relativePath == "growth.bin" })
+        #expect(projection.roots.contains { $0.relativePath == "reclaimed.bin" })
+        let condition1 = (projection.roots.contains(where: \.isRemainder))
+        #expect(condition1)
+    }
+
+    @Test
+    func testSignificantProjectionHonorsExactChangeKindSelection() async throws {
+        let grewBefore = makeTestFileNode(id: "/scan/grew.bin", name: "grew.bin", size: 10)
+        let beforeRoot = makeTestDirectoryNode(id: "/scan", name: "scan", children: [grewBefore])
+        let beforeStore = FileTreeStore(root: beforeRoot, childrenByID: [beforeRoot.id: [grewBefore]])
+
+        let grewAfter = makeTestFileNode(id: "/scan/grew.bin", name: "grew.bin", size: 20)
+        let added = makeTestFileNode(id: "/scan/added.bin", name: "added.bin", size: 50)
+        let afterRoot = makeTestDirectoryNode(id: "/scan", name: "scan", children: [grewAfter, added])
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [
+                afterRoot.id: [grewAfter, added]
+            ])
+        let comparison = try await ScanComparisonService().compare(
+            before: makeTestSnapshot(root: beforeRoot, store: beforeStore),
+            after: makeTestSnapshot(root: afterRoot, store: afterStore)
+        )
+
+        let addedProjection = comparison.changeTree.significantProjection(changeKinds: [.added])
+        let grewProjection = comparison.changeTree.significantProjection(changeKinds: [.grew])
+        let combinedProjection = comparison.changeTree.significantProjection(changeKinds: [.added, .grew])
+
+        #expect(addedProjection.roots.map(\.relativePath) == ["added.bin"])
+        #expect(addedProjection.roots.first?.increasedAllocatedSize == 50)
+        #expect(addedProjection.roots.first?.directChangeKind == .added)
+        #expect(grewProjection.roots.map(\.relativePath) == ["grew.bin"])
+        #expect(grewProjection.roots.first?.increasedAllocatedSize == 10)
+        #expect(grewProjection.roots.first?.directChangeKind == .grew)
+        #expect(Set(combinedProjection.roots.map(\.relativePath)) == ["added.bin", "grew.bin"])
+    }
+
+    @Test
+    func testComparisonClampsAggregateStorageOverflow() async throws {
+        let beforeRoot = makeTestDirectoryNode(id: "/scan", name: "scan", children: [])
+        let beforeStore = FileTreeStore(root: beforeRoot)
+        let first = makeTestFileNode(
+            id: "/scan/first.bin",
+            name: "first.bin",
+            size: .max
+        )
+        let second = makeTestFileNode(
+            id: "/scan/second.bin",
+            name: "second.bin",
+            size: .max
+        )
+        let afterRoot = FileNodeRecord(
+            id: "/scan",
+            url: URL(filePath: "/scan", directoryHint: .isDirectory),
+            name: "scan",
+            isDirectory: true,
+            isSymbolicLink: false,
+            allocatedSize: .max,
+            logicalSize: .max,
+            descendantFileCount: 2,
+            lastModified: nil,
+            isPackage: false,
+            isAccessible: true,
+            isSelfAccessible: true,
+            isSynthetic: false,
+            isAutoSummarized: false
+        )
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [afterRoot.id: [first, second]]
+        )
+
+        let comparison = try await ScanComparisonService().compare(
+            before: makeTestSnapshot(root: beforeRoot, store: beforeStore),
+            after: makeTestSnapshot(root: afterRoot, store: afterStore)
+        )
+        let projection = comparison.changeTree.significantProjection(changeKinds: [.added])
+
+        #expect(comparison.rows.count == 2)
+        #expect(comparison.summary.grossIncreasedAllocatedSize == Int64.max)
+        #expect(projection.totalImpact == Int64.max)
+        #expect(projection.representedImpact == Int64.max)
+    }
+
+    @Test
+    func testTopLevelChangesClampLargeReclamationUnderOnePath() async throws {
+        let first = makeTestFileNode(id: "/scan/folder/first.bin", name: "first.bin", size: .max)
+        let second = makeTestFileNode(id: "/scan/folder/second.bin", name: "second.bin", size: .max)
+        let beforeFolder = FileNodeRecord(
+            id: "/scan/folder",
+            url: URL(filePath: "/scan/folder", directoryHint: .isDirectory),
+            name: "folder",
+            isDirectory: true,
+            isSymbolicLink: false,
+            allocatedSize: .max,
+            logicalSize: .max,
+            descendantFileCount: 2,
+            lastModified: nil,
+            isPackage: false,
+            isAccessible: true,
+            isSelfAccessible: true,
+            isSynthetic: false,
+            isAutoSummarized: false
+        )
+        let beforeRoot = FileNodeRecord(
+            id: "/scan",
+            url: URL(filePath: "/scan", directoryHint: .isDirectory),
+            name: "scan",
+            isDirectory: true,
+            isSymbolicLink: false,
+            allocatedSize: .max,
+            logicalSize: .max,
+            descendantFileCount: 2,
+            lastModified: nil,
+            isPackage: false,
+            isAccessible: true,
+            isSelfAccessible: true,
+            isSynthetic: false,
+            isAutoSummarized: false
+        )
+        let beforeStore = FileTreeStore(
+            root: beforeRoot,
+            childrenByID: [
+                beforeRoot.id: [beforeFolder],
+                beforeFolder.id: [first, second],
+            ])
+        let afterFolder = makeTestDirectoryNode(id: "/scan/folder", name: "folder", children: [])
+        let afterRoot = makeTestDirectoryNode(id: "/scan", name: "scan", children: [afterFolder])
+        let afterStore = FileTreeStore(
+            root: afterRoot,
+            childrenByID: [afterRoot.id: [afterFolder]]
+        )
+
+        let comparison = try await ScanComparisonService().compare(
+            before: makeTestSnapshot(root: beforeRoot, store: beforeStore),
+            after: makeTestSnapshot(root: afterRoot, store: afterStore)
+        )
+        let location = try #require(comparison.topLevelChanges.first)
+
+        #expect(comparison.rows.count == 2)
+        #expect(location.relativePath == "folder")
+        #expect(location.allocatedDelta == -Int64.max)
+        #expect(location.absoluteAllocatedDelta == Int64.max)
+        #expect(location.reclaimedAllocatedSize == Int64.max)
+    }
+
+    @Test
+    func testRowQueryCombinesSelectedChangeKinds() throws {
+        let movedBefore = makeTestFileNode(id: "/before/old.bin", name: "old.bin", size: 100)
+        let movedAfter = makeTestFileNode(id: "/after/new.bin", name: "new.bin", size: 150)
+        let movedAndGrew = ScanComparisonRow(
+            relativePath: "new.bin",
+            kind: .moved,
+            beforeNode: movedBefore,
+            afterNode: movedAfter,
+            movedFromRelativePath: "old.bin"
+        )
+        let removed = ScanComparisonRow(
+            relativePath: "removed.bin",
+            kind: .removed,
+            beforeNode: makeTestFileNode(id: "/before/removed.bin", name: "removed.bin", size: 40),
+            afterNode: nil
+        )
+        let rows = [movedAndGrew, removed]
+
+        let movedAndRemoved = try ScanComparisonRowQuery(
+            changeKinds: [.moved, .removed],
+            searchText: "",
+            sortOrder: []
+        ).applying(to: rows, cancellationCheck: {})
+        let removedOnly = try ScanComparisonRowQuery(
+            changeKinds: [.removed],
+            searchText: "",
+            sortOrder: []
+        ).applying(to: rows, cancellationCheck: {})
+        let movedOnly = try ScanComparisonRowQuery(
+            changeKinds: [.moved],
+            searchText: "",
+            sortOrder: []
+        ).applying(to: rows, cancellationCheck: {})
+
+        #expect(movedAndRemoved.map(\.relativePath) == ["new.bin", "removed.bin"])
+        #expect(removedOnly.map(\.relativePath) == ["removed.bin"])
+        #expect(movedOnly.map(\.relativePath) == ["new.bin"])
+    }
+
+    @Test
+    func testSearchIndexStopsWhenCancellationIsRequested() throws {
+        let rows = makeComparisonRows(count: 600)
+        let probe = CancellationProbe(throwOnCheck: 3)
+
+        #expect(throws: CancellationError.self) {
+            try ScanComparisonSearchIndex(
+                rows: rows,
+                cancellationCheck: probe.check
+            )
+        }
+        #expect(probe.checkCount == 3)
+    }
+
+    @Test
+    func testRowQueryStopsFilteringWhenCancellationIsRequested() throws {
+        let rows = makeComparisonRows(count: 600)
+        let probe = CancellationProbe(throwOnCheck: 3)
+        let query = ScanComparisonRowQuery(searchText: "", sortOrder: [])
+
+        #expect(throws: CancellationError.self) {
+            try query.applying(
+                to: rows,
+                cancellationCheck: probe.check
+            )
+        }
+        #expect(probe.checkCount == 3)
+    }
+
+    @Test
+    func testRowQueryStopsBetweenLargeSortRuns() throws {
+        let rows = makeComparisonRows(count: 20_000)
+        let filteringCheckCount = (rows.count + 255) / 256
+        // Entry, filtering, post-filter, offset preparation, first sorted run,
+        // then cancellation before the second run starts.
+        let secondSortedRunCheck = 1 + filteringCheckCount + 1 + filteringCheckCount + 2
+        let probe = CancellationProbe(throwOnCheck: secondSortedRunCheck)
+        let query = ScanComparisonRowQuery(
+            searchText: "",
+            sortOrder: [
+                ScanComparisonRowComparator(field: .afterAllocatedSize, order: .reverse)
+            ]
+        )
+
+        #expect(throws: CancellationError.self) {
+            try query.applying(
+                to: rows,
+                cancellationCheck: probe.check
+            )
+        }
+        #expect(probe.checkCount == secondSortedRunCheck)
+    }
+
+    @Test
+    func testSignificantProjectionCancelsDuringCoverageAndRemainderWork() async throws {
+        let files = (0..<600).map {
+            makeTestFileNode(id: "/root/file-\($0).bin", name: "file-\($0).bin", size: Int64($0))
+        }
+        let comparison = try await ScanComparisonService().compare(
+            before: cloneSnapshot([]), after: cloneSnapshot(files)
+        )
+        var checks = 0
+        let expected = comparison.changeTree.significantProjection(changeKinds: [.added])
+        let measured = comparison.changeTree.significantProjection(
+            changeKinds: [.added], cancellationCheck: { checks += 1 }
+        )
+        #expect(measured == expected)
+        // Cancellation after eligibility preparation and near the end of remainder aggregation.
+        for limit in [6, checks - 1] {
+            let probe = CancellationProbe(throwOnCheck: limit)
+            #expect(throws: CancellationError.self) {
+                try comparison.changeTree.significantProjection(
+                    changeKinds: [.added], cancellationCheck: probe.check
+                )
+            }
+            #expect(probe.checkCount == limit)
+        }
+    }
+
+    private func resourceIdentity(fileID: UInt64, volumeToken: UInt64) -> FileIdentity {
+        var data = Data()
+        var littleEndianFileID = fileID.littleEndian
+        var littleEndianVolumeToken = volumeToken.littleEndian
+        withUnsafeBytes(of: &littleEndianFileID) { data.append(contentsOf: $0) }
+        withUnsafeBytes(of: &littleEndianVolumeToken) { data.append(contentsOf: $0) }
+        return FileIdentity(resourceIdentifier: data)
+    }
+
+    private func cloneSnapshot(_ files: [FileNodeRecord]) -> ScanSnapshot {
+        let root = makeTestDirectoryNode(id: "/root", name: "root", children: files)
+        let store = FileTreeStore(root: root, childrenByID: [root.id: files])
+        return makeTestSnapshot(root: root, store: store)
+    }
+
+    private func makeComparisonRows(count: Int) -> [ScanComparisonRow] {
+        (0..<count).map { index in
+            let relativePath = "file-\(index).bin"
+            let node = makeTestFileNode(
+                id: "/after/\(relativePath)",
+                name: relativePath,
+                size: Int64(index)
+            )
+            return ScanComparisonRow(
+                relativePath: relativePath,
+                kind: .added,
+                beforeNode: nil,
+                afterNode: node
+            )
+        }
+    }
+}

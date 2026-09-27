@@ -1,0 +1,730 @@
+import Darwin
+import Foundation
+import Testing
+
+@testable import RadixCore
+
+/// Opt-in measurements for the performance audit; elapsed times are never test assertions.
+struct PerformanceAuditBenchmarkTests {
+    @MainActor
+    @Test(
+        .tags(.benchmark),
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RADIX_BENCH_DIRECTORY_PUBLICATION"] == "1",
+            "Set RADIX_BENCH_DIRECTORY_PUBLICATION=1 to measure directory publication."))
+    func testLargeDirectoryPublicationBenchmark() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        let count = environment["RADIX_BENCH_DIRECTORY_FILES"].flatMap(Int.init) ?? 1_000_000
+        let dense = Self.makeFlatSnapshot(fileCount: count, rootID: "/navigation/dense")
+        let root = makeTestDirectoryNode(id: "/navigation", name: "navigation", children: [dense.root])
+        let store = try FileTreeStore.combining(
+            root: root,
+            childSubtrees: [try #require(FileTreeStore.SubtreeSource(store: dense.treeStore, rootedAt: dense.root.id))],
+            cancellationCheck: {}
+        )
+        let snapshot = makeTestSnapshot(root: root, store: store)
+
+        func sample(_ phase: String, operation: () -> Void, ready: () -> Bool) async throws {
+            let heartbeat = Task { @MainActor in
+                var previous = ContinuousClock.now
+                var longestGap = 0.0
+                while !Task.isCancelled {
+                    do { try await Task.sleep(for: .milliseconds(1)) } catch { break }
+                    let now = ContinuousClock.now
+                    longestGap = max(longestGap, BenchmarkSupport.durationSeconds(previous.duration(to: now)))
+                    previous = now
+                }
+                return longestGap
+            }
+            defer { heartbeat.cancel() }
+            try await Task.sleep(for: .milliseconds(2))
+            let startedAt = ContinuousClock.now
+            let submission = BenchmarkSupport.measure(operation)
+            while !ready() {
+                guard startedAt.duration(to: .now) < .seconds(60) else {
+                    Issue.record("Directory publication timed out: \(phase)")
+                    return
+                }
+                try await Task.sleep(for: .milliseconds(1))
+            }
+            let completedSeconds = BenchmarkSupport.durationSeconds(startedAt.duration(to: .now))
+            try await Task.sleep(for: .milliseconds(2))
+            heartbeat.cancel()
+            let longestGap = await heartbeat.value
+            Self.report(
+                phase: phase, count: count, seconds: completedSeconds,
+                extra: "main_actor_submit=\(BenchmarkSupport.format(submission.seconds)) "
+                    + "main_actor_longest_gap=\(BenchmarkSupport.format(longestGap))"
+            )
+        }
+
+        let navigation = WorkspaceNavigationModel()
+        navigation.updateScanContext(snapshot: snapshot)
+        for iteration in 1...3 {
+            try await sample("directory_enter_\(iteration)") {
+                navigation.focus(nodeID: dense.root.id)
+            } ready: {
+                navigation.tableNodes.count == count
+            }
+            #expect(navigation.tableNodes.first?.name == "item-0.dat")
+            #expect(navigation.tableNodes.last?.name == "item-\(count - 1).dat")
+            try await sample("directory_exit_\(iteration)") {
+                navigation.navigateToParent()
+            } ready: {
+                navigation.tableNodes.count == 1
+            }
+        }
+
+        let browser = FileBrowserModel(searchDebounceDuration: .zero)
+        browser.updateContent(
+            nodes: store.children(of: dense.root.id), contentID: dense.root.id,
+            snapshot: snapshot, fileTreeStore: store
+        )
+        try await waitUntil(timeout: 60) { !browser.isRefreshingCurrentContents }
+        #expect(browser.displayedNodes.count == count)
+        for iteration in 1...3 {
+            try await sample("browser_filter_clear_\(iteration)") {
+                browser.setActiveQuery(FileBrowserQuery(itemKind: .folder))
+            } ready: {
+                !browser.isRefreshingCurrentContents
+            }
+            #expect(browser.displayedNodes.isEmpty)
+            browser.setActiveQuery(FileBrowserQuery())
+            try await waitUntil(timeout: 60) { !browser.isRefreshingCurrentContents }
+            #expect(browser.displayedNodes.count == count)
+        }
+        try await sample("browser_content_clear") {
+            browser.updateContent(nodes: [], contentID: "empty", snapshot: nil, fileTreeStore: nil)
+        } ready: {
+            !browser.isRefreshingCurrentContents
+        }
+        #expect(browser.displayedNodes.isEmpty)
+        browser.cleanup()
+        withExtendedLifetime(dense) {}
+        withExtendedLifetime(snapshot) {}
+    }
+
+    @MainActor
+    @Test(
+        .tags(.benchmark),
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RADIX_BENCH_COMPARISON"] == "1",
+            "Set RADIX_BENCH_COMPARISON=1 to measure comparison preparation."))
+    func testComparisonPreparationBenchmark() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        let count = environment["RADIX_BENCH_COMPARISON_FILES"].flatMap(Int.init) ?? 100_000
+        let before = Self.makeFlatSnapshot(fileCount: 0)
+        let after = Self.makeFlatSnapshot(fileCount: count)
+        let service = ScanComparisonService(profileReporter: { phase, duration in
+            BenchmarkSupport.report(
+                prefix: "RADIX_BENCH_AUDIT_RESULT", phase: "comparison_\(phase.rawValue)",
+                seconds: BenchmarkSupport.durationSeconds(duration), count: count,
+                peakRSS: BenchmarkSupport.peakResidentBytes()
+            )
+        })
+        let comparison = try await service.compare(before: before, after: after)
+        #expect(comparison.rows.count == count)
+        let model = ScanComparisonBrowserModel(searchDebounceNanoseconds: 0)
+        let queries: [(String, ScanComparisonRowQuery)] = [
+            ("initial", .init(searchText: "", sortOrder: [])),
+            ("path", .init(searchText: "", sortOrder: [], pathPrefix: "item-0.dat")),
+            ("sort", .init(searchText: "", sortOrder: [.defaultOrder])),
+            ("search_cold", .init(searchText: "item-0.dat", sortOrder: [])),
+            ("search_warm", .init(searchText: "item-1.dat", sortOrder: [])),
+        ]
+        for (phase, query) in queries {
+            let start = ContinuousClock.now
+            model.refresh(
+                comparisonID: comparison.id, rows: comparison.rows,
+                changeTree: comparison.changeTree, query: query
+            )
+            // Avoid spinning the main actor while its background request runs.
+            while model.isRefreshing { try await Task.sleep(for: .milliseconds(1)) }
+            let seconds = BenchmarkSupport.durationSeconds(start.duration(to: .now))
+            var fingerprint = ChartResponsivenessBenchmarkSupport.fnvOffsetBasis
+            for row in model.displayedRows {
+                ChartResponsivenessBenchmarkSupport.hash(row.relativePath, into: &fingerprint)
+            }
+            // Sets have process-dependent iteration order; hash ordered projection nodes and totals.
+            ChartResponsivenessBenchmarkSupport.hash(String(reflecting: model.projection.roots), into: &fingerprint)
+            ChartResponsivenessBenchmarkSupport.hash(
+                "\(model.projection.totalImpact):\(model.projection.representedImpact):\(model.projection.hiddenRootCount)",
+                into: &fingerprint
+            )
+            Self.report(
+                phase: "comparison_refresh_\(phase)", count: count, seconds: seconds,
+                extra: "rows=\(model.displayedRows.count) fingerprint=\(String(fingerprint, radix: 16))"
+            )
+        }
+        withExtendedLifetime(comparison) {}
+    }
+
+    @MainActor
+    @Test(
+        .tags(.benchmark),
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RADIX_BENCH_CHART_PREPARATION"] == "1",
+            "Set RADIX_BENCH_CHART_PREPARATION=1 to measure chart preparation."))
+    func testChartPreparationBenchmark() throws {
+        let environment = ProcessInfo.processInfo.environment
+        let scenario = environment["RADIX_BENCH_CHART_SCENARIO"] ?? "sunburst_flat"
+        let count = environment["RADIX_BENCH_CHART_FILES"].flatMap(Int.init) ?? 1_000_000
+        let snapshot = Self.makeFlatSnapshot(fileCount: count, rootID: "/chart/dense")
+        let store: FileTreeStore
+        let layoutRootID: String
+        if scenario == "treemap_tiny" {
+            let root = makeTestDirectoryNode(id: "/chart", name: "chart", children: [snapshot.root])
+            store = try FileTreeStore.combining(
+                root: root,
+                childSubtrees: [
+                    try #require(FileTreeStore.SubtreeSource(store: snapshot.treeStore, rootedAt: snapshot.root.id))
+                ],
+                cancellationCheck: {}
+            )
+            layoutRootID = root.id
+        } else {
+            store = snapshot.treeStore
+            layoutRootID =
+                scenario == "sunburst_focused"
+                ? try #require(store.childrenPrefix(of: store.rootID, maxCount: 1).first).id
+                : store.rootID
+        }
+        let tree = ChartReadProbe(store)
+        let initialRSS = BenchmarkMemorySampler.currentResidentMemoryBytes()
+        let initialPeak = BenchmarkSupport.peakResidentBytes()
+        let seconds: Double
+        let descriptions: [String]
+        switch scenario {
+        case "sunburst_flat", "sunburst_focused":
+            let measurement = try BenchmarkSupport.measure {
+                try SunburstLayout.segments(
+                    in: tree, rootID: layoutRootID, depthLimit: 6, cancellationCheck: {}
+                )
+            }
+            seconds = measurement.seconds
+            descriptions = measurement.value.map { String(reflecting: $0) }
+        case "treemap_tiny":
+            let measurement = try BenchmarkSupport.measure {
+                try TreemapLayout.segments(
+                    in: tree, rootID: layoutRootID, depthLimit: 6,
+                    size: CGSize(width: 40, height: 40), cancellationCheck: {}
+                )
+            }
+            seconds = measurement.seconds
+            descriptions = measurement.value.map { String(reflecting: $0) }
+        default:
+            Issue.record("Unknown chart scenario: \(scenario)")
+            return
+        }
+        #expect(descriptions.count == 1)
+        var fingerprint = ChartResponsivenessBenchmarkSupport.fnvOffsetBasis
+        for description in descriptions {
+            ChartResponsivenessBenchmarkSupport.hash(description, into: &fingerprint)
+        }
+        Self.report(
+            phase: "chart_preparation_\(scenario)", count: count, seconds: seconds,
+            extra: "initial_rss=\(initialRSS) initial_peak_rss=\(initialPeak) timed_layout_only=1 "
+                + "projected_nodes=\(tree.projectedNodeCount) root_reads=\(tree.childReadCount(for: store.rootID)) "
+                + "segments=\(descriptions.count) fingerprint=\(String(fingerprint, radix: 16))"
+        )
+        withExtendedLifetime(snapshot) {}
+        withExtendedLifetime(tree) {}
+    }
+
+    @MainActor
+    @Test(
+        .tags(.benchmark),
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RADIX_BENCH_AUDIT"] == "1",
+            "Set RADIX_BENCH_AUDIT=1 to run the navigation audit benchmark."))
+    func testNavigationAuditBenchmark() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        let counts =
+            environment["RADIX_BENCH_AUDIT_ROWS"].flatMap(Int.init)
+            .map { [max($0, 1)] } ?? [100_000, 1_000_000]
+        print("RADIX_BENCH_AUDIT_LAYOUT file_node_stride=\(MemoryLayout<FileNodeRecord>.stride)")
+
+        for count in counts {
+            let fixture = BenchmarkSupport.measure { Self.makeFlatSnapshot(fileCount: count) }
+            Self.report(phase: "fixture", count: count, seconds: fixture.seconds)
+            let snapshot = fixture.value
+            let sunburst = try BenchmarkSupport.measure {
+                try SunburstLayout.segments(
+                    in: snapshot.treeStore, rootID: snapshot.root.id,
+                    depthLimit: 6, cancellationCheck: {}
+                )
+            }
+            Self.report(
+                phase: "sunburst_flat_global_root_layout",
+                count: count,
+                seconds: sunburst.seconds,
+                extra: "input_nodes=\(snapshot.treeStore.nodeCount) segments=\(sunburst.value.count)"
+            )
+            let treemap = try BenchmarkSupport.measure {
+                try TreemapLayout.segments(
+                    in: snapshot.treeStore, rootID: snapshot.root.id,
+                    depthLimit: 6, size: CGSize(width: 1200, height: 800), cancellationCheck: {}
+                )
+            }
+            Self.report(
+                phase: "treemap_flat_global_root_layout",
+                count: count,
+                seconds: treemap.seconds,
+                extra: "input_nodes=\(snapshot.treeStore.nodeCount) segments=\(treemap.value.count)"
+            )
+            let model = WorkspaceNavigationModel()
+            let beforeInstallRSS = BenchmarkMemorySampler.currentResidentMemoryBytes()
+            let installation = BenchmarkSupport.measure {
+                model.updateScanContext(snapshot: snapshot)
+            }
+            try await waitUntil(timeout: 60) { model.tableNodes.count == count }
+            #expect(model.tableNodes.count == count)
+            Self.report(
+                phase: "install_scan_context_main_actor",
+                count: count,
+                seconds: installation.seconds,
+                extra:
+                    "rss_delta=\(BenchmarkSupport.byteDelta(from: beforeInstallRSS, to: BenchmarkMemorySampler.currentResidentMemoryBytes()))"
+            )
+
+            let tableRefresh = BenchmarkSupport.measure { model.refreshTableNodesForCurrentContext() }
+            Self.report(phase: "refresh_unchanged_table_main_actor", count: count, seconds: tableRefresh.seconds)
+
+            let contextRefresh = BenchmarkSupport.measure { model.updateScanContext(snapshot: snapshot) }
+            Self.report(
+                phase: "refresh_unchanged_scan_context_main_actor", count: count, seconds: contextRefresh.seconds)
+
+            let reconciliation = BenchmarkSupport.measure { model.reconcileAfterSnapshotApplied(snapshot) }
+            Self.report(
+                phase: "reconcile_unchanged_scan_context_main_actor", count: count, seconds: reconciliation.seconds)
+
+            for selectedCount in [0, 1] {
+                model.select(nodeID: selectedCount == 0 ? nil : model.tableNodes.last?.id)
+                var samples: [Double] = []
+                for _ in 0..<5 {
+                    let result = BenchmarkSupport.measure { model.selectedNodes }
+                    #expect(result.value.count == selectedCount)
+                    samples.append(result.seconds)
+                }
+                Self.report(
+                    phase: "selected_nodes_main_actor",
+                    count: count,
+                    seconds: BenchmarkSupport.median(samples) ?? 0,
+                    extra: "selected=\(selectedCount) samples=5"
+                )
+                let directLookup = BenchmarkSupport.measure { model.selectedNode }
+                #expect((directLookup.value == nil ? 0 : 1) == selectedCount)
+                Self.report(
+                    phase: "selected_node_direct_lookup_main_actor",
+                    count: count,
+                    seconds: directLookup.seconds,
+                    extra: "selected=\(selectedCount)"
+                )
+                let summary = BenchmarkSupport.measure {
+                    InspectorSelectionSummary(selectedNodes: model.selectedNodes, fileTreeStore: snapshot.treeStore)
+                }
+                #expect(summary.value.selectedCount == selectedCount)
+                Self.report(
+                    phase: "selection_summary_with_resolution_main_actor",
+                    count: count,
+                    seconds: summary.seconds,
+                    extra: "selected=\(selectedCount)"
+                )
+            }
+        }
+    }
+
+    @Test(.tags(.benchmark), .enabled(if: ProcessInfo.processInfo.environment["RADIX_BENCH_ENUMERATION_PATH"] != nil))
+    func testNativeEnumerationAllocationBenchmark() throws {
+        guard let path = ProcessInfo.processInfo.environment["RADIX_BENCH_ENUMERATION_PATH"] else {
+            throw TestFixtureError("Set RADIX_BENCH_ENUMERATION_PATH to measure native enumeration buffers.")
+        }
+        Self.reportRetention(phase: "enumeration_initial")
+        let start = ContinuousClock.now
+        let resultValue = try
+            (BulkDirectoryEnumerator.directoryEntries(
+                at: URL(filePath: path, directoryHint: .isDirectory),
+                includeHiddenFiles: true,
+                metadataLoader: ScanMetadataLoader(),
+                cancellationCheck: Task.checkCancellation
+            ))
+        let result = try #require(resultValue)
+        let seconds = BenchmarkSupport.durationSeconds(start.duration(to: .now))
+        var nativeNames = 0
+        var missingMetadata = 0
+        for entry in result.entries {
+            if entry.nativeName != nil { nativeNames += 1 }
+            if entry.metadata == nil { missingMetadata += 1 }
+        }
+        #expect(result.entries.count == result.enumeratedItemCount)
+        #expect(missingMetadata == 0)
+        withExtendedLifetime(result) {
+            Self.reportRetention(
+                phase: "enumeration_retained", seconds: seconds,
+                extra: "entries=\(result.entries.count) native_names=\(nativeNames)")
+        }
+    }
+
+    @Test(
+        .tags(.benchmark),
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RADIX_BENCH_METADATA_PATH"] != nil,
+            "Set RADIX_BENCH_METADATA_PATH to an audit fixture containing directory, file, and symlink."))
+    func testMetadataReadAuditBenchmark() throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["RADIX_BENCH_METADATA_PATH"] else {
+            throw TestFixtureError(
+                "Set RADIX_BENCH_METADATA_PATH to an audit fixture containing directory, file, and symlink.")
+        }
+        let root = URL(filePath: path, directoryHint: .isDirectory)
+        let loader = ScanMetadataLoader()
+        for scenario in ["directory", "symlink", "file", "missing-allocation"] {
+            let url = root.appending(path: scenario == "missing-allocation" ? "file" : scenario)
+            let keys =
+                scenario == "missing-allocation"
+                ? ScanMetadataLoader.scanResourceKeys.subtracting([
+                    .fileAllocatedSizeKey, .totalFileAllocatedSizeKey,
+                    .linkCountKey, .fileResourceIdentifierKey,
+                ]) : ScanMetadataLoader.scanResourceKeys
+            let values = try url.resourceValues(forKeys: keys)
+            let start = ContinuousClock.now
+            var total: Int64 = 0
+            var identities = 0
+            for _ in 0..<10_000 {
+                let metadata = loader.metadata(for: url, prefetchedResourceValues: values)
+                total += metadata.allocatedSize
+                if metadata.fileIdentity != nil { identities += 1 }
+            }
+            let elapsed = start.duration(to: .now)
+            #expect(identities == 10_000)
+            print(
+                "RADIX_BENCH_METADATA scenario=\(scenario) seconds=\(BenchmarkSupport.durationSeconds(elapsed)) allocated_sum=\(total) identities=\(identities)"
+            )
+        }
+    }
+
+    @Test(
+        .tags(.benchmark),
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RADIX_BENCH_LEAF_PATH"] == "1",
+            "Set RADIX_BENCH_LEAF_PATH=1 to measure path extraction during node preparation."))
+    func testLeafPreparationPathBenchmark() {
+        let environment = ProcessInfo.processInfo.environment
+        let count = max(environment["RADIX_BENCH_LEAF_PATH_COUNT"].flatMap(Int.init) ?? 200_000, 1)
+        let scenario = environment["RADIX_BENCH_LEAF_PATH_SCENARIO"] ?? "ascii"
+        let parentPath =
+            scenario == "unicode"
+            ? "/audit/" + String(repeating: "层级-é-😀-路径/", count: 24)
+            : "/audit/"
+        let parent = URL(filePath: parentPath, directoryHint: .isDirectory)
+        let urls = (0..<count).map { index in
+            parent.appending(
+                path: scenario == "unicode" ? "文件-cafe\u{301}-\(index)-100% #?.dat" : "file-\(index).dat",
+                directoryHint: .notDirectory
+            )
+        }
+        let metadata = NodeMetadata(
+            isDirectory: false, isPackage: false, isSymbolicLink: false,
+            logicalSize: 16, allocatedSize: 4_096, lastModified: nil, isReadable: true,
+            volumeCapacity: nil, fileIdentity: nil, linkCount: 1
+        )
+        let engine = ScanEngine()
+        let measurement = BenchmarkSupport.measure {
+            urls.map { engine.makeFileNode(url: $0, metadata: metadata) }
+        }
+        #expect(measurement.value.count == count)
+        #expect(
+            zip(measurement.value, urls).allSatisfy {
+                $0.id == $1.path && $0.name == $1.lastPathComponent
+            })
+        let pathBytes = measurement.value.reduce(0) { $0 + $1.id.utf8.count }
+        let nameBytes = measurement.value.reduce(0) { $0 + $1.name.utf8.count }
+        print(
+            "RADIX_BENCH_LEAF_PATH scenario=\(scenario) count=\(count) "
+                + "seconds=\(BenchmarkSupport.format(measurement.seconds)) "
+                + "path_bytes=\(pathBytes) name_bytes=\(nameBytes) "
+                + "peak_rss=\(BenchmarkSupport.peakResidentBytes())"
+        )
+    }
+
+    @Test(
+        .tags(.benchmark),
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RADIX_BENCH_AUDIT_PATH"] != nil,
+            "Set RADIX_BENCH_AUDIT_PATH to scan an existing audit fixture."))
+    func testFilesystemAuditBenchmark() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        guard let path = environment["RADIX_BENCH_AUDIT_PATH"] else {
+            throw TestFixtureError("Set RADIX_BENCH_AUDIT_PATH to scan an existing audit fixture.")
+        }
+        let usesFoundation = environment["RADIX_BENCH_AUDIT_FOUNDATION"] == "1"
+        let engine: ScanEngine
+        if usesFoundation {
+            engine = ScanEngine(directoryContents: { url, keys, options, cancellationCheck in
+                try cancellationCheck()
+                let contents = try FileManager.default.contentsOfDirectory(
+                    at: url,
+                    includingPropertiesForKeys: keys,
+                    options: options
+                )
+                try cancellationCheck()
+                return contents
+            })
+        } else {
+            engine = ScanEngine()
+        }
+        var options = ScanOptions()
+        options.autoSummarizeDirectories = false
+        options.includeHiddenFiles = true
+        let target = ScanTarget(url: URL(filePath: path, directoryHint: .isDirectory))
+        var finished: ScanSnapshot?
+        var progressEvents = 0
+        let initialRSS = BenchmarkMemorySampler.currentResidentMemoryBytes()
+        var finalizationStartedAt: ContinuousClock.Instant?
+        var finalizationRSS: UInt64 = 0
+        var peakRSSAtFinalization: UInt64 = 0
+        let startedAt = ContinuousClock.now
+        for try await event in engine.scan(target: target, options: options) {
+            switch event {
+            case .progress(let metrics):
+                progressEvents += 1
+                if metrics.isFinalizing, finalizationStartedAt == nil {
+                    finalizationStartedAt = .now
+                    finalizationRSS = BenchmarkMemorySampler.currentResidentMemoryBytes()
+                    peakRSSAtFinalization = BenchmarkSupport.peakResidentBytes()
+                }
+            case .finished(let snapshot):
+                finished = snapshot
+            case .warning, .executionMode:
+                break
+            }
+        }
+        let elapsed = BenchmarkSupport.durationSeconds(startedAt.duration(to: .now))
+        let finalizationSeconds =
+            finalizationStartedAt.map {
+                BenchmarkSupport.durationSeconds($0.duration(to: .now))
+            } ?? 0
+        let snapshot = try #require(finished)
+        print(
+            "RADIX_BENCH_AUDIT_FILESYSTEM mode=\(usesFoundation ? "foundation" : "native") "
+                + "seconds=\(BenchmarkSupport.format(elapsed)) "
+                + "files=\(snapshot.aggregateStats.fileCount) folders=\(snapshot.aggregateStats.directoryCount) "
+                + "nodes=\(snapshot.treeStore.nodeCount) progress_events=\(progressEvents) "
+                + "warnings=\(snapshot.scanWarnings.count) peak_rss=\(BenchmarkSupport.peakResidentBytes()) "
+                + "initial_rss=\(initialRSS) finalization_rss=\(finalizationRSS) "
+                + "peak_rss_at_finalization=\(peakRSSAtFinalization) "
+                + "finished_rss=\(BenchmarkMemorySampler.currentResidentMemoryBytes()) "
+                + "finalization_seconds=\(BenchmarkSupport.format(finalizationSeconds)) "
+                + "allocated=\(snapshot.root.allocatedSize) logical=\(snapshot.root.logicalSize) "
+                + "fingerprint=\(scanResultFingerprint(snapshot.treeStore))"
+        )
+    }
+
+    @MainActor
+    @Test(
+        .tags(.benchmark),
+        .enabled(
+            if: ProcessInfo.processInfo.environment["RADIX_BENCH_RETENTION"] == "1",
+            "Set RADIX_BENCH_RETENTION=1 to measure snapshot ownership and release."))
+    func testSnapshotRetentionBenchmark() async throws {
+        let environment = ProcessInfo.processInfo.environment
+        let scenario = environment["RADIX_BENCH_RETENTION_SCENARIO"] ?? "single"
+        let fileCount = environment["RADIX_BENCH_RETENTION_FILES"].flatMap(Int.init) ?? 1_000_000
+        let path = environment["RADIX_BENCH_RETENTION_PATH"]
+        let cache = CompletedScanCache(maxTotalNodeCount: 250_000)
+        let navigation = WorkspaceNavigationModel()
+        Self.reportRetention(phase: "initial")
+        switch scenario {
+        case "single":
+            try await Self.retainSnapshot(fileCount: fileCount, path: path, cache: cache, scenario: scenario)
+        case "repeat":
+            for iteration in 0..<3 {
+                try await Self.retainSnapshot(
+                    fileCount: fileCount, path: path, cache: cache, scenario: scenario, iteration: iteration)
+                Self.reportRetention(phase: "released_\(iteration)")
+            }
+        case "cache":
+            for iteration in 0..<3 {
+                try await Self.retainSnapshot(
+                    fileCount: fileCount, path: path, cache: cache, scenario: scenario, iteration: iteration)
+                await cache.waitForPendingReleases()
+                withExtendedLifetime(cache) {
+                    Self.reportRetention(phase: "cache_only_\(iteration)")
+                }
+            }
+        case "scope":
+            try await Self.retainSnapshot(fileCount: fileCount, path: path, cache: cache, scenario: scenario)
+            withExtendedLifetime(cache) {
+                Self.reportRetention(phase: "scope_only")
+            }
+        case "navigation":
+            try await Self.retainSnapshot(
+                fileCount: fileCount, path: path, cache: cache, scenario: scenario, navigation: navigation)
+            Self.reportRetention(phase: "navigation_and_cache")
+        default:
+            Issue.record("Unknown retention scenario: \(scenario)")
+        }
+        let clearStartedAt = ContinuousClock.now
+        cache.removeAll()
+        Self.reportRetention(
+            phase: "cache_cleared", seconds: BenchmarkSupport.durationSeconds(clearStartedAt.duration(to: .now)))
+        let navigationClearStartedAt = ContinuousClock.now
+        navigation.updateScanContext(snapshot: nil)
+        Self.reportRetention(
+            phase: "released", seconds: BenchmarkSupport.durationSeconds(navigationClearStartedAt.duration(to: .now)))
+        await cache.waitForPendingReleases()
+        try await Task.sleep(for: .milliseconds(100))
+        Self.reportRetention(phase: "settled")
+        let relievedBytes = malloc_zone_pressure_relief(nil, 0)
+        Self.reportRetention(phase: "allocator_relief", extra: "relieved_bytes=\(relievedBytes)")
+        if let pauseSeconds = environment["RADIX_BENCH_RETENTION_PAUSE_SECONDS"].flatMap(Int.init), pauseSeconds > 0 {
+            // Allow a separate vmmap capture after every snapshot owner releases.
+            fflush(nil)
+            try await Task.sleep(for: .seconds(pauseSeconds))
+        }
+    }
+
+    // The separate frame and explicit lifetimes keep ownership checkpoints
+    // meaningful in optimized builds without adding a production retention hook.
+    @inline(never)
+    @MainActor
+    private static func retainSnapshot(
+        fileCount: Int,
+        path: String?,
+        cache: CompletedScanCache,
+        scenario: String,
+        iteration: Int = 0,
+        navigation: WorkspaceNavigationModel? = nil
+    ) async throws {
+        let snapshot: ScanSnapshot
+        var options = ScanOptions()
+        options.autoSummarizeDirectories = false
+        options.includeHiddenFiles = iteration.isMultiple(of: 2)
+        options.treatPackagesAsDirectories = iteration > 1
+        let startedAt = ContinuousClock.now
+        if let path {
+            snapshot = try await scanRetentionFixture(path: path, options: options)
+        } else {
+            snapshot = autoreleasepool {
+                makeFlatSnapshot(fileCount: fileCount, rootID: "/retention/scan-\(iteration)")
+            }
+        }
+        withExtendedLifetime(snapshot) {
+            reportRetention(
+                phase: "retained_\(iteration)", seconds: BenchmarkSupport.durationSeconds(startedAt.duration(to: .now)),
+                extra: "nodes=\(snapshot.treeStore.nodeCount)")
+        }
+        if scenario == "cache" {
+            let storeStartedAt = ContinuousClock.now
+            cache.store(snapshot, for: ScanCacheKey(target: snapshot.target, options: options))
+            reportRetention(
+                phase: "stored_\(iteration)",
+                seconds: BenchmarkSupport.durationSeconds(storeStartedAt.duration(to: .now)))
+        } else if scenario == "scope" || scenario == "navigation" {
+            let child = try #require(snapshot.treeStore.childrenPrefix(of: snapshot.root.id, maxCount: 1).first)
+            let scope = try #require(snapshot.scoped(to: ScanTarget(url: child.url)))
+            if let navigation {
+                cache.store(snapshot, for: ScanCacheKey(target: snapshot.target, options: options))
+                navigation.updateScanContext(snapshot: snapshot)
+                navigation.updateScanContext(snapshot: scope)
+                #expect(navigation.state.fileTreeStore?.nodeCount == scope.treeStore.nodeCount)
+            } else {
+                cache.store(scope, for: ScanCacheKey(target: scope.target, options: options))
+            }
+            withExtendedLifetime(snapshot) {
+                reportRetention(phase: "parent_and_scope", extra: "scope_nodes=\(scope.treeStore.nodeCount)")
+            }
+        }
+        withExtendedLifetime(snapshot) {}
+    }
+
+    @inline(never)
+    private static func scanRetentionFixture(path: String, options: ScanOptions) async throws -> ScanSnapshot {
+        var completed: ScanSnapshot?
+        for try await event in ScanEngine().scan(
+            target: ScanTarget(url: URL(filePath: path, directoryHint: .isDirectory)),
+            options: options
+        ) {
+            if case .finished(let snapshot) = event {
+                completed = snapshot
+            }
+        }
+        let snapshot = try #require(completed)
+        #expect(snapshot.isComplete)
+        #expect(snapshot.scanWarnings.isEmpty)
+        return snapshot
+    }
+
+    private static func reportRetention(phase: String, seconds: Double = 0, extra: String = "") {
+        var statistics = malloc_statistics_t()
+        malloc_zone_statistics(nil, &statistics)
+        var vmInfo = task_vm_info_data_t()
+        var infoCount = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<natural_t>.size)
+        let result = withUnsafeMutablePointer(to: &vmInfo) { pointer in
+            pointer.withMemoryRebound(to: integer_t.self, capacity: Int(infoCount)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &infoCount)
+            }
+        }
+        #expect(result == KERN_SUCCESS)
+        print(
+            "RADIX_BENCH_RETENTION phase=\(phase) seconds=\(BenchmarkSupport.format(seconds)) main_thread=\(Thread.isMainThread ? 1 : 0) pid=\(ProcessInfo.processInfo.processIdentifier) "
+                + "rss=\(BenchmarkMemorySampler.currentResidentMemoryBytes()) "
+                + "peak_rss=\(BenchmarkSupport.peakResidentBytes()) "
+                + "footprint=\(vmInfo.phys_footprint) reusable=\(vmInfo.reusable) "
+                + "malloc_in_use=\(statistics.size_in_use) malloc_reserved=\(statistics.size_allocated) "
+                + "malloc_blocks=\(statistics.blocks_in_use) \(extra)"
+        )
+    }
+
+    private static func makeFlatSnapshot(fileCount: Int, rootID: String = "/audit") -> ScanSnapshot {
+        let allocatedSize = Int64(fileCount) * Int64(fileCount + 1) / 2
+        let root = ChartResponsivenessBenchmarkSupport.node(
+            id: rootID, name: "audit", isDirectory: true,
+            allocatedSize: allocatedSize, descendantFileCount: fileCount
+        )
+        var nodes = [root]
+        nodes.reserveCapacity(fileCount + 1)
+        var indexByNodeID = [rootID: FileTreeNodeIndex(rawValue: 0)]
+        indexByNodeID.reserveCapacity(fileCount + 1)
+        var childIndices: [FileTreeNodeIndex] = []
+        childIndices.reserveCapacity(fileCount)
+        for offset in 0..<fileCount {
+            let name = "item-\(offset).dat"
+            let id = rootID + "/" + name
+            let index = FileTreeNodeIndex(rawValue: UInt32(nodes.count))
+            nodes.append(
+                ChartResponsivenessBenchmarkSupport.node(
+                    id: id, name: name, isDirectory: false,
+                    allocatedSize: Int64(fileCount - offset), descendantFileCount: 1
+                ))
+            indexByNodeID[id] = index
+            childIndices.append(index)
+        }
+        var parentIndices = Array(repeating: UInt32(0), count: nodes.count)
+        parentIndices[0] = UInt32.max
+        var childSpans = Array(repeating: FileTreeChildSpan(), count: nodes.count)
+        childSpans[0] = FileTreeChildSpan(start: 0, count: UInt32(fileCount))
+        let store = FileTreeStore(
+            verifiedRootIndex: FileTreeNodeIndex(rawValue: 0),
+            nodes: nodes,
+            indexByNodeID: indexByNodeID,
+            parentRawIndices: parentIndices,
+            childSpans: childSpans,
+            childIndices: childIndices,
+            orderedNodeIndices: [FileTreeNodeIndex(rawValue: 0)] + childIndices,
+            aggregateStats: ScanAggregateStats(
+                totalAllocatedSize: allocatedSize, totalLogicalSize: allocatedSize,
+                fileCount: fileCount, directoryCount: 1,
+                accessibleItemCount: nodes.count, inaccessibleItemCount: 0
+            )
+        )
+        return makeTestSnapshot(root: root, store: store)
+    }
+
+    private static func report(phase: String, count: Int, seconds: Double, extra: String = "") {
+        BenchmarkSupport.report(
+            prefix: "RADIX_BENCH_AUDIT_RESULT", phase: phase, seconds: seconds,
+            count: count, peakRSS: BenchmarkSupport.peakResidentBytes(), extra: extra
+        )
+    }
+}
