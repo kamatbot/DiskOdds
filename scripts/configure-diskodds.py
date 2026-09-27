@@ -1,75 +1,70 @@
 #!/usr/bin/env python3
-"""Idempotent, pinned-upstream migration. Generated changes are committed, not required at app startup."""
+"""Idempotently finish fork integration; all generated changes are committed before validation."""
 from pathlib import Path
 import json
-import plistlib
-import subprocess
+import re
 
 root = Path(__file__).resolve().parents[1]
+assert 'com.kamatbot.DiskOdds;' in (root / 'Radix.xcodeproj/project.pbxproj').read_text()
+assert 'name: "DiskOddsCore"' in (root / 'Package.swift').read_text()
 
-def update(relative, transform):
+def update(relative, old, new):
     path = root / relative
-    before = path.read_text()
-    after = transform(before)
-    if before != after:
-        path.write_text(after)
-        print(relative)
+    text = path.read_text()
+    if new in text:
+        return
+    assert text.count(old) == 1, f'Unexpected migration input: {relative}'
+    path.write_text(text.replace(old, new, 1))
+    print(relative)
 
+# The upstream audit enumerated every non-UI file into a single package target.
+# DiskOddsCore is a separately compiled, automatically discovered target with its own audit.
+update('RadixCoreTests/LocalizationCatalogTests.swift',
+       '["App", "Features", "Shared"].contains(firstComponent)',
+       '["App", "Features", "Shared", "DeveloperCleanup"].contains(firstComponent)')
+# Swift's catalog format escapes literal percentages. Normalize them when comparing
+# a source interpolation template with its real compiled localization key.
+update('RadixCoreTests/LocalizationCatalogTests.swift',
+       'options: .regularExpression\n        )\n    }\n\n    private func replacingSwiftInterpolations',
+       'options: .regularExpression\n        ).replacingOccurrences(of: "%%", with: "%")\n    }\n\n    private func replacingSwiftInterpolations')
 
-def package(text):
-    if 'name: "DiskOddsCore"' in text:
-        return text
-    anchor = '        .testTarget(\n            name: "RadixCoreTests",'
-    assert text.count(anchor) == 1, "Unexpected upstream Package.swift"
-    text = text.replace('                "App",', '                "App",\n                "DeveloperCleanup",', 1)
-    return text.replace(anchor, '''        .target(
-            name: "DiskOddsCore",
-            path: "Radix/DeveloperCleanup/Core"
-        ),
-        .testTarget(
-            name: "DiskOddsCoreTests",
-            dependencies: ["DiskOddsCore"],
-            path: "DiskOddsCoreTests"
-        ),
-''' + anchor, 1)
+translations = json.loads((root / 'scripts/diskodds-ui-translations.json').read_text())
+locales = ['de', 'es', 'fr', 'it', 'ru', 'zh-Hans']
+# A brand name is invariant in every locale.
+translations['DiskOdds'] = ['DiskOdds'] * len(locales)
+catalog_path = root / 'Radix/Localizable.xcstrings'
+catalog = json.loads(catalog_path.read_text())
+for key, values in translations.items():
+    assert len(values) == len(locales), f'Incomplete translations: {key}'
+    specifiers = lambda value: sorted(re.findall(r'%(?:[0-9]+\$)?(?:lld|ld|llu|lu|d|u|f|@)', value))
+    assert all(specifiers(key) == specifiers(value) for value in values), f'Changed placeholders: {key}'
+    catalog['strings'][key] = {
+        'comment': 'DiskOdds developer-cleanup interface. Confidence is heuristic, not a probability guarantee.',
+        'extractionState': 'manual',
+        'localizations': {locale: {'stringUnit': {'state': 'translated', 'value': value}}
+                          for locale, value in [('en', key), *zip(locales, values)]}
+    }
+catalog_path.write_text(json.dumps(catalog, ensure_ascii=False, indent=2) + '\n')
 
+update('Radix/DeveloperCleanup/Core/CleanupExecutor.swift',
+       '        let url = URL(fileURLWithPath: item.path)\n        try CleanupFileSystem.validatePath(url)',
+       '''        #if os(macOS)
+        let runningApp = Bundle.main.bundleURL.path
+        guard item.path != runningApp, !CleanupPolicy.contains(item.path, runningApp) else {
+            throw CleanupFailure.rejected("The selected folder contains the running DiskOdds app. Keep it and clean other builds.")
+        }
+        #endif
+        let url = URL(fileURLWithPath: item.path)
+        try CleanupFileSystem.validatePath(url)''')
+update('Radix/DeveloperCleanup/Core/CleanupFileSystem.swift',
+       '                    || name.hasSuffix(".xcarchive") || name.hasSuffix(".keychain-db") {',
+       '''                    || name.hasPrefix(".env.") || name.hasSuffix(".p12") || name.hasSuffix(".mobileprovision")
+                    || name.hasSuffix(".xcarchive") || name.hasSuffix(".keychain-db") {''')
 
-def project(text):
-    if 'PRODUCT_BUNDLE_IDENTIFIER = com.kamatbot.DiskOdds;' in text:
-        return text
-    old = 'PRODUCT_BUNDLE_IDENTIFIER = com.colinkim.Radix;\n\t\t\t\tPRODUCT_NAME = "$(TARGET_NAME)";'
-    assert text.count(old) == 2, "Unexpected upstream app build settings"
-    text = text.replace(old, 'PRODUCT_BUNDLE_IDENTIFIER = com.kamatbot.DiskOdds;\n\t\t\t\tPRODUCT_NAME = DiskOdds;')
-    text = text.replace('com.colinkim.RadixCoreTests', 'com.kamatbot.DiskOddsExplorerTests')
-    text = text.replace('INFOPLIST_KEY_CFBundleDisplayName = Radix;', 'INFOPLIST_KEY_CFBundleDisplayName = DiskOdds;')
-    text = text.replace('MARKETING_VERSION = 1.8.0;', 'MARKETING_VERSION = 0.1.0;')
-    text = text.replace('Radix.app', 'DiskOdds.app')
-    text = text.replace('42MBX5D86L', '""').replace('"Developer ID Application"', '"-"')
-    return text
-
-update('Package.swift', package)
-update('Radix.xcodeproj/project.pbxproj', project)
-for path in (root / 'Radix.xcodeproj/xcshareddata/xcschemes').glob('*.xcscheme'):
-    update(str(path.relative_to(root)), lambda text: text.replace('Radix.app', 'DiskOdds.app'))
-info_path = root / 'Radix/Info.plist'
-info = plistlib.loads(info_path.read_bytes())
-for key in ['SUFeedURL', 'SUPublicEDKey', 'SUEnableAutomaticChecks', 'SUScheduledCheckInterval']:
-    info.pop(key, None)
-for document in info.get('CFBundleDocumentTypes', []):
-    document['LSHandlerRank'] = 'Alternate'
-info_path.write_bytes(plistlib.dumps(info, sort_keys=False))
-strings_path = root / 'Radix/InfoPlist.xcstrings'
-strings = json.loads(strings_path.read_text())
-for key in ['CFBundleDisplayName', 'CFBundleName']:
-    for localization in strings['strings'][key]['localizations'].values():
-        localization['stringUnit']['value'] = 'DiskOdds'
-strings_path.write_text(json.dumps(strings, ensure_ascii=False, indent=2) + '\n')
-original_readme = root / 'docs/RADIX-UPSTREAM.md'
-if not original_readme.exists():
-    original_readme.parent.mkdir(exist_ok=True)
-    result = subprocess.run(['git', 'show', '14a76df4fe626dcdefc4f2abbc868dff4bbbd6e4:README.md'], cwd=root,
-                            capture_output=True, check=True)
-    original_readme.write_bytes(result.stdout)
-assert 'SUFeedURL' not in plistlib.loads(info_path.read_bytes())
-assert 'startingUpdater: true' not in (root / 'Radix/RadixApp.swift').read_text()
-print('DiskOdds identity, independent test target, and update-channel isolation configured.')
+update('README.md',
+       'Custom DerivedData directories, arbitrary temporary folders, `.build`, general `build`/`dist` folders, Docker volumes, agent worktree pruning, and model-level deletion are deliberately not inferred as disposable.',
+       'Known project-local DerivedData subdirectories are supported through opt-in folders; see [project build coverage](docs/PROJECT-BUILD-COVERAGE.md). Arbitrary custom DerivedData paths, temporary folders, the whole `.build` directory, general `build`/`dist` folders, Docker volumes, agent worktree pruning, and model-level deletion are deliberately not inferred as disposable.')
+update('README.md',
+       'The first cleanup UI is in English; the inherited explorer retains its existing locales.',
+       'The cleanup interface includes catalog entries for the inherited locales; detailed rule explanations and some dynamic tool text remain English in this first release. The inherited explorer retains its existing locales.')
+print(f'Integrated {len(translations)} localized UI keys and independent-core source coverage without disabling the audits.')
