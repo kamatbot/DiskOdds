@@ -45,6 +45,7 @@ jobs:
         run: |
           ditto -c -k --sequesterRsrc --keepParent .build/xcode-derived-data/Build/Products/Debug/DiskOdds.app DiskOdds-macOS-arm64-unsigned.zip
           git rev-parse HEAD > validated-commit.txt
+          git archive --format=zip --output=DiskOdds-source.zip HEAD
       - name: Preserve test results and coverage
         if: always()
         uses: actions/upload-artifact@v7
@@ -56,6 +57,7 @@ jobs:
             xcode-tests.log
             diskodds-preview.png
             DiskOdds-macOS-arm64-unsigned.zip
+            DiskOdds-source.zip
             validated-commit.txt
           include-hidden-files: true
           if-no-files-found: ignore
