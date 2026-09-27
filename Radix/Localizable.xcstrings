@@ -30290,7 +30290,8 @@
             "value": "工作区"
           }
         }
-      }
+      },
+      "generatesSymbol": false
     },
     "Developer cleanup": {
       "comment": "DiskOdds developer-cleanup interface. Confidence is heuristic, not a probability guarantee.",
@@ -30530,7 +30531,8 @@
             "value": "工作区"
           }
         }
-      }
+      },
+      "generatesSymbol": false
     },
     "PROJECT FOLDERS": {
       "comment": "DiskOdds developer-cleanup interface. Confidence is heuristic, not a probability guarantee.",
@@ -31874,7 +31876,8 @@
             "value": "%lld%%"
           }
         }
-      }
+      },
+      "generatesSymbol": false
     },
     "Show in Trash": {
       "comment": "DiskOdds developer-cleanup interface. Confidence is heuristic, not a probability guarantee.",
