@@ -29,6 +29,7 @@ nonisolated enum CleanupFileSystem {
     /// Foundation's directory enumerator spends most of its time on those URL objects, which
     /// dominates cleanup scans of DerivedData, package caches, and model stores.
     static func measure(_ url: URL, limit: Int = 300_000) throws -> DiskSnapshot {
+        try Task.checkCancellation()
         let rootPath = fileSystemBytes(url)
         var root = stat()
         let opened = openForMeasure(rootPath, metadata: &root)
@@ -40,10 +41,9 @@ nonisolated enum CleanupFileSystem {
         var complete = true
         var shared = false
         var identities = Set<Identity>()
-        var stop = false
         var stack: [DirectoryFrame] = []
         defer {
-            for frame in stack { close(frame.descriptor) }
+            for frame in stack { closedir(frame.stream) }
         }
         switch opened {
         case .unsafe:
@@ -53,66 +53,65 @@ nonisolated enum CleanupFileSystem {
         case .leaf:
             break
         case .directory(let descriptor):
-            stack.append(DirectoryFrame(descriptor: descriptor, path: rootPath))
+            guard let stream = fdopendir(descriptor) else {
+                close(descriptor)
+                throw CleanupFailure.rejected("This directory cannot be read.")
+            }
+            stack.append(DirectoryFrame(descriptor: descriptor, stream: stream, path: rootPath, metadata: root))
         }
         let rootDevice = UInt64(truncatingIfNeeded: root.st_dev)
         absorb(path: rootPath, name: nil, metadata: root, allocated: &allocated, logical: &logical, count: &count,
                newest: &newest, signature: &signature, shared: &shared, identities: &identities)
-        while let frame = stack.popLast() {
-            if stop {
-                close(frame.descriptor)
+        // Keep only the active ancestry open, not every pending sibling. Wide cache
+        // trees can otherwise exhaust macOS's descriptor limit before any descent.
+        while let frame = stack.last {
+            if count % 128 == 0 { try Task.checkCancellation() }
+            errno = 0
+            guard let entry = readdir(frame.stream) else {
+                if errno != 0 { complete = false }
+                var finalMetadata = stat()
+                if fstat(frame.descriptor, &finalMetadata) != 0
+                    || !sameDirectory(finalMetadata, frame.metadata) { complete = false }
+                closedir(frame.stream)
+                stack.removeLast()
                 continue
             }
-            defer { close(frame.descriptor) }
-            var childNames: [[UInt8]] = []
-            let duplicated = dup(frame.descriptor)
-            guard duplicated >= 0, let directory = fdopendir(duplicated) else {
-                if duplicated >= 0 { close(duplicated) }
+            guard let name = entryName(entry) else { complete = false; continue }
+            if isDot(name) { continue }
+            guard count < limit else { complete = false; break }
+            var child = stat()
+            guard fstatat(frame.descriptor, name, &child, AT_SYMLINK_NOFOLLOW) == 0 else {
                 complete = false
                 continue
             }
-            defer { closedir(directory) }
-            while !stop {
-                if count % 128 == 0 { try Task.checkCancellation() }
-                errno = 0
-                guard let entry = readdir(directory) else {
-                    if errno != 0 { complete = false }
-                    break
-                }
-                guard let name = entryName(entry), !isDot(name) else { continue }
-                guard count < limit else { complete = false; stop = true; break }
-                var child = stat()
-                let statResult = fstatat(frame.descriptor, name, &child, AT_SYMLINK_NOFOLLOW)
-                guard statResult == 0 else { complete = false; continue }
-                if UInt64(truncatingIfNeeded: child.st_dev) != rootDevice {
-                    complete = false
-                    continue
-                }
-                let symlink = child.st_mode & S_IFMT == S_IFLNK
-                let protected = isProtected(name)
-                if protected { complete = false }
-                absorb(path: frame.path, name: name, metadata: child, allocated: &allocated, logical: &logical,
-                       count: &count, newest: &newest, signature: &signature, shared: &shared, identities: &identities)
-                if !symlink && !protected && child.st_mode & S_IFMT == S_IFDIR {
-                    childNames.append(nameBytes(name))
-                }
+            guard UInt64(truncatingIfNeeded: child.st_dev) == rootDevice else {
+                complete = false
+                continue
             }
-            guard !stop else { continue }
-            for name in childNames {
-                var terminated = name
-                terminated.append(0)
-                let childDescriptor = terminated.withUnsafeBytes { raw -> Int32 in
-                    guard let base = raw.baseAddress else { return -1 }
-                    return base.assumingMemoryBound(to: UInt8.self).withMemoryRebound(to: CChar.self, capacity: raw.count) { pointer in
-                        openat(frame.descriptor, pointer, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
-                    }
-                }
-                guard childDescriptor >= 0 else { complete = false; continue }
-                var childPath = frame.path
-                if childPath.last != UInt8(ascii: "/") { childPath.append(UInt8(ascii: "/")) }
-                childPath.append(contentsOf: name)
-                stack.append(DirectoryFrame(descriptor: childDescriptor, path: childPath))
+            let protected = isProtected(name)
+            if protected { complete = false }
+            absorb(path: frame.path, name: name, metadata: child, allocated: &allocated, logical: &logical,
+                   count: &count, newest: &newest, signature: &signature, shared: &shared, identities: &identities)
+            guard !protected, child.st_mode & S_IFMT == S_IFDIR else { continue }
+            // Fail closed on exceptionally deep trees; never consume unbounded FDs.
+            guard stack.count < 128 else { complete = false; continue }
+            let descriptor = openat(frame.descriptor, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+            guard descriptor >= 0 else { complete = false; continue }
+            var openedMetadata = stat()
+            guard fstat(descriptor, &openedMetadata) == 0, sameDirectory(openedMetadata, child) else {
+                close(descriptor)
+                complete = false
+                continue
             }
+            guard let stream = fdopendir(descriptor) else {
+                close(descriptor)
+                complete = false
+                continue
+            }
+            var childPath = frame.path
+            if childPath.last != UInt8(ascii: "/") { childPath.append(UInt8(ascii: "/")) }
+            childPath.append(contentsOf: nameBytes(name))
+            stack.append(DirectoryFrame(descriptor: descriptor, stream: stream, path: childPath, metadata: openedMetadata))
         }
         return DiskSnapshot(identity: "\(root.st_dev):\(root.st_ino)", signature: signature,
                             allocatedBytes: allocated, logicalBytes: logical, entryCount: count,
@@ -140,14 +139,47 @@ nonisolated enum CleanupFileSystem {
                 if kind != S_IFDIR { return .leaf }
                 let descriptor = open(pointer, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
                 guard descriptor >= 0 else { return .unreadable }
+                var opened = stat()
+                guard fstat(descriptor, &opened) == 0, sameDirectory(opened, metadata.pointee) else {
+                    close(descriptor)
+                    return .unsafe
+                }
+                metadata.pointee = opened
                 return .directory(descriptor)
             }
         }
     }
 
+    #if canImport(Darwin)
+    private typealias DirectoryStream = UnsafeMutablePointer<DIR>
+    #else
+    private typealias DirectoryStream = OpaquePointer
+    #endif
+
     private struct DirectoryFrame {
-        var descriptor: Int32
-        var path: [UInt8]
+        let descriptor: Int32
+        let stream: DirectoryStream
+        let path: [UInt8]
+        let metadata: stat
+    }
+
+    /// Confirm the descriptor still identifies the directory we statted, on the
+    /// same device. A replaced directory or newly mounted volume is not traversed.
+    private static func sameDirectory(_ actual: stat, _ expected: stat) -> Bool {
+        guard actual.st_mode & S_IFMT == S_IFDIR,
+              actual.st_dev == expected.st_dev, actual.st_ino == expected.st_ino,
+              actual.st_mode == expected.st_mode else { return false }
+        #if canImport(Darwin)
+        return actual.st_mtimespec.tv_sec == expected.st_mtimespec.tv_sec
+            && actual.st_mtimespec.tv_nsec == expected.st_mtimespec.tv_nsec
+            && actual.st_ctimespec.tv_sec == expected.st_ctimespec.tv_sec
+            && actual.st_ctimespec.tv_nsec == expected.st_ctimespec.tv_nsec
+        #else
+        return actual.st_mtim.tv_sec == expected.st_mtim.tv_sec
+            && actual.st_mtim.tv_nsec == expected.st_mtim.tv_nsec
+            && actual.st_ctim.tv_sec == expected.st_ctim.tv_sec
+            && actual.st_ctim.tv_nsec == expected.st_ctim.tv_nsec
+        #endif
     }
 
     private struct Identity: Hashable {
@@ -294,18 +326,19 @@ nonisolated enum CleanupFileSystem {
             hashByte(&hash, UInt8(ascii: "0"))
             return
         }
-        // UInt64 needs at most 20 digits. The buffer stays on the stack.
-        var digits = InlineArray<20, UInt8>(repeating: 0)
-        var remainder = value
-        var index = digits.count
-        while remainder > 0 {
-            index -= 1
-            digits[index] = UInt8(ascii: "0") + UInt8(remainder % 10)
-            remainder /= 10
-        }
-        while index < digits.count {
-            hashByte(&hash, digits[index])
-            index += 1
+        // UInt64 needs at most 20 digits. Unlike InlineArray, this supports macOS 14.
+        withUnsafeTemporaryAllocation(of: UInt8.self, capacity: 20) { digits in
+            var remainder = value
+            var index = digits.count
+            while remainder > 0 {
+                index -= 1
+                digits[index] = UInt8(ascii: "0") + UInt8(remainder % 10)
+                remainder /= 10
+            }
+            while index < digits.count {
+                hashByte(&hash, digits[index])
+                index += 1
+            }
         }
     }
 }

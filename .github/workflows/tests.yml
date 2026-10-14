@@ -19,6 +19,21 @@ jobs:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
+      - name: Record source provenance
+        run: |
+          set -euo pipefail
+          git rev-parse HEAD > validated-commit.txt
+          git rev-parse 'HEAD^{tree}' > validated-tree.txt
+          git archive --format=zip --output=DiskOdds-source.zip HEAD
+      - name: Preserve reviewed source independently of build outcome
+        uses: actions/upload-artifact@v7
+        with:
+          name: review-source
+          path: |
+            DiskOdds-source.zip
+            validated-commit.txt
+            validated-tree.txt
+          retention-days: 14
       - name: Core tests through Swift Package Manager
         run: |
           set -euo pipefail
@@ -31,22 +46,20 @@ jobs:
             -derivedDataPath .build/xcode-derived-data \
             -resultBundlePath .build/Tests.xcresult CODE_SIGNING_ALLOWED=NO \
             2>&1 | tee xcode-tests.log
-      - name: Non-destructive full-window preview
-        continue-on-error: true
+      - name: Build optimized Apple Silicon app
         run: |
           set -euo pipefail
-          app="$PWD/.build/xcode-derived-data/Build/Products/Debug/DiskOdds.app"
-          open -n "$app" --args --diskodds-demo
-          sleep 8
-          window=$(swift -e 'import CoreGraphics; let windows = CGWindowListCopyWindowInfo(.optionAll, kCGNullWindowID) as? [[String: Any]] ?? []; for w in windows where w[kCGWindowOwnerName as String] as? String == "DiskOdds" && w[kCGWindowLayer as String] as? Int == 0 { if let id = w[kCGWindowNumber as String] { print(id); break } }')
-          test -n "$window"
-          screencapture -x -o -l "$window" diskodds-preview.png
-      - name: Package unsigned Apple Silicon developer build
+          xcodebuild build -project Radix.xcodeproj -scheme Radix \
+            -configuration Release -destination 'platform=macOS' -arch arm64 \
+            -derivedDataPath .build/xcode-release CODE_SIGNING_ALLOWED=NO \
+            ENABLE_DEBUG_DYLIB=NO 2>&1 | tee release-build.log
+      - name: Sign developer bundle and verify ZIP round trip
         run: |
-          ditto -c -k --sequesterRsrc --keepParent .build/xcode-derived-data/Build/Products/Debug/DiskOdds.app DiskOdds-macOS-arm64-unsigned.zip
-          git rev-parse HEAD > validated-commit.txt
-          git archive --format=zip --output=DiskOdds-source.zip HEAD
-      - name: Preserve test results and coverage
+          set -euo pipefail
+          python3 scripts/package-reviewed-app.py \
+            .build/xcode-release/Build/Products/Release/DiskOdds.app \
+            2>&1 | tee package-validation.log
+      - name: Preserve test results and build artifacts
         if: always()
         uses: actions/upload-artifact@v7
         with:
@@ -55,10 +68,17 @@ jobs:
             .build/Tests.xcresult
             core-tests.log
             xcode-tests.log
+            release-build.log
+            package-validation.log
+            smoke-launch.log
+            smoke-result.json
             diskodds-preview.png
-            DiskOdds-macOS-arm64-unsigned.zip
+            DiskOdds-macOS-arm64-dev.zip
             DiskOdds-source.zip
+            build-metadata.json
+            SHA256SUMS.txt
             validated-commit.txt
+            validated-tree.txt
           include-hidden-files: true
-          if-no-files-found: ignore
+          if-no-files-found: error
           retention-days: 14
