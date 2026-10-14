@@ -50,7 +50,7 @@ jobs:
         run: |
           set -euo pipefail
           xcodebuild build -project Radix.xcodeproj -scheme Radix \
-            -configuration Release -destination 'platform=macOS' -arch arm64 \
+            -configuration Release -destination 'platform=macOS,arch=arm64' \
             -derivedDataPath .build/xcode-release CODE_SIGNING_ALLOWED=NO \
             ENABLE_DEBUG_DYLIB=NO 2>&1 | tee release-build.log
       - name: Sign developer bundle and verify ZIP round trip
