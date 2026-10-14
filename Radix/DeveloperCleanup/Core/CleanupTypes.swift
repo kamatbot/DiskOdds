@@ -183,8 +183,9 @@ nonisolated enum CleanupPolicy {
 
 extension URL {
     /// Appends a relative path without statting the disk or encoding separators.
-    /// `appendingPathComponent` stats to decide on a trailing slash and is the wrong call for multi-component paths.
-    func cleanupChild(_ relative: String) -> URL {
+    /// Explicitly nonisolated because the Xcode app defaults to MainActor isolation,
+    /// while scans and cleanup execution run outside the main actor.
+    nonisolated func cleanupChild(_ relative: String) -> URL {
         appending(path: relative, directoryHint: .notDirectory)
     }
 }
