@@ -12,6 +12,12 @@ private func item(_ path: String, kind: CleanupKind = .derivedBuild, action: Cle
                 odds: 98, reasons: [], impact: "", recovery: "", blocker: nil)
 }
 
+@Test func nestedCleanupPathsKeepSeparators() {
+    let home = URL(fileURLWithPath: "/Users/test")
+    #expect(home.cleanupChild("Library/Developer/Xcode/DerivedData").path == "/Users/test/Library/Developer/Xcode/DerivedData")
+    #expect(home.cleanupChild(".next/cache").path == "/Users/test/.next/cache")
+    #expect(home.cleanupChild(".build/xcode-derived-data/Build").lastPathComponent == "Build")
+}
 @Test func oldBuildHasHighButNotCertainConfidence() {
     #expect(CleanupPolicy.confidence(kind: .derivedBuild, snapshot: snapshot()) == 98)
 }
@@ -59,6 +65,49 @@ private func item(_ path: String, kind: CleanupKind = .derivedBuild, action: Cle
     #expect(!SimulatorDevice(udid: UUID().uuidString, name: "x", state: "Booted", isAvailable: false).removable())
     #expect(!SimulatorDevice(udid: UUID().uuidString, name: "x", state: "Shutdown", isAvailable: nil).removable())
 }
+@Test func measurementDoesNotFollowDirectorySymlink() throws {
+    let base = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+    let parent = base.appendingPathComponent("parent")
+    let target = base.appendingPathComponent("target")
+    try FileManager.default.createDirectory(at: target.appendingPathComponent(".git"), withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: base) }
+    try Data(repeating: 7, count: 1_048_576).write(to: target.appendingPathComponent("payload"))
+    try FileManager.default.createSymbolicLink(at: parent.appendingPathComponent("link"), withDestinationURL: target)
+    let snapshot = try CleanupFileSystem.measure(parent)
+    #expect(snapshot.complete)
+    #expect(snapshot.entryCount == 2)
+    #expect(snapshot.allocatedBytes < 256 * 1024)
+}
+
+@Test func measurementLimitOfOneCountsOnlyTheRoot() throws {
+    let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Data("child".utf8).write(to: root.appendingPathComponent("child"))
+    let snapshot = try CleanupFileSystem.measure(root, limit: 1)
+    #expect(snapshot.entryCount == 1)
+    #expect(!snapshot.complete)
+}
+
+@Test func measurementCountsNestedFilesAndChangesWhenBytesChange() throws {
+    let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
+    let file = root.appendingPathComponent("a").appendingPathComponent("b").appendingPathComponent("file")
+    try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: root) }
+    try Data("before".utf8).write(to: file)
+    let first = try CleanupFileSystem.measure(root)
+    #expect(first.entryCount == 4)
+    #expect(first.complete)
+    let second = try CleanupFileSystem.measure(root)
+    #expect(first == second)
+    #expect(first.signature == second.signature)
+    try Data("after the bytes change".utf8).write(to: file)
+    let third = try CleanupFileSystem.measure(root)
+    #expect(first != third)
+    #expect(first.signature != third.signature)
+}
+
 @Test func filesystemDetectsChangedDescendantsAndLimits() throws {
     let root = FileManager.default.temporaryDirectory.resolvingSymlinksInPath().appendingPathComponent(UUID().uuidString)
     try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)

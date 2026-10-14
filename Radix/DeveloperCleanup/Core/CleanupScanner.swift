@@ -37,7 +37,7 @@ nonisolated struct CleanupScanner: Sendable {
             do { return try FileManager.default.contentsOfDirectory(at: url, includingPropertiesForKeys: nil) }
             catch { report.warnings.append("Cannot list \(url.path): \(error.localizedDescription)"); return [] }
         }
-        let derived = context.home.appendingPathComponent("Library/Developer/Xcode/DerivedData")
+        let derived = context.home.cleanupChild("Library/Developer/Xcode/DerivedData")
         for project in children(derived) {
             if CleanupPolicy.xcodeCaches.contains(project.lastPathComponent) {
                 try add(project, title: project.lastPathComponent, kind: .xcodeCache,
@@ -45,14 +45,14 @@ nonisolated struct CleanupScanner: Sendable {
                         recovery: "Restore from Trash, or build your project again.")
             } else {
                 for name in CleanupPolicy.derivedPaths {
-                    try add(project.appendingPathComponent(name), title: "\(project.lastPathComponent) / \(name)", kind: .derivedBuild,
+                    try add(project.cleanupChild(name), title: "\(project.lastPathComponent) / \(name)", kind: .derivedBuild,
                             impact: "Removes generated build or index data, not SourcePackages or source code. The next build or indexing pass takes longer.",
                             recovery: "Restore from Trash, or reopen and rebuild the original project.")
                 }
             }
         }
         for path in CleanupPolicy.cachePaths {
-            try add(context.home.appendingPathComponent(path), title: URL(fileURLWithPath: path).lastPathComponent == "_cacache" ? "npm download cache" : URL(fileURLWithPath: path).lastPathComponent,
+            try add(context.home.cleanupChild(path), title: URL(fileURLWithPath: path).lastPathComponent == "_cacache" ? "npm download cache" : URL(fileURLWithPath: path).lastPathComponent,
                     kind: .packageCache,
                     impact: "Packages may need downloading again. Offline builds can fail; custom changes inside a cache are not guaranteed recoverable.",
                     recovery: "Restore from Trash before emptying it, or let the package manager download again.")
@@ -68,11 +68,11 @@ nonisolated struct CleanupScanner: Sendable {
                 guard values?.isDirectory == true, values?.isSymbolicLink != true else { continue }
                 let entries = children(directory)
                 let isProject = ["package.json", "Package.swift"].contains {
-                    FileManager.default.fileExists(atPath: directory.appendingPathComponent($0).path)
+                    FileManager.default.fileExists(atPath: directory.cleanupChild($0).path)
                 } || entries.contains { ["xcodeproj", "xcworkspace"].contains($0.pathExtension) }
                 if isProject {
                     for suffix in CleanupPolicy.projectPaths {
-                        let target = directory.appendingPathComponent(suffix)
+                        let target = directory.cleanupChild(suffix)
                         guard FileManager.default.fileExists(atPath: target.path) else { continue }
                         var blocker: String?
                         do { try commands.verifyProjectCache(path: target.path, project: directory.path) }
@@ -99,7 +99,7 @@ nonisolated struct CleanupScanner: Sendable {
                 guard UUID(uuidString: device.udid) != nil else { continue }
                 let unavailable = device.isAvailable == false
                 let kind: CleanupKind = unavailable ? .unavailableSimulator : .availableSimulator
-                let url = context.home.appendingPathComponent("Library/Developer/CoreSimulator/Devices/\(device.udid)")
+                let url = context.home.cleanupChild("Library/Developer/CoreSimulator/Devices/\(device.udid)")
                 try add(url, title: device.name + (unavailable ? " · unavailable" : " · \(device.state)"), kind: kind,
                         action: device.removable() ? .deleteSimulator : .guide,
                         impact: "Deleting a simulator permanently removes its installed apps, test databases, photos, and settings. It does not uninstall the shared runtime.",
@@ -128,7 +128,7 @@ nonisolated struct CleanupScanner: Sendable {
         if let path = env["HF_HUB_CACHE"], path.hasPrefix("/") { stores.append((path, "Custom Hugging Face model store")) }
         else if let path = env["HF_HOME"], path.hasPrefix("/") { stores.append((path + "/hub", "Custom Hugging Face model store")) }
         for (path, title) in stores {
-            let url = path.hasPrefix("/") ? URL(fileURLWithPath: path) : context.home.appendingPathComponent(path)
+            let url = path.hasPrefix("/") ? URL(fileURLWithPath: path) : context.home.cleanupChild(path)
             try add(url, title: title, kind: .modelStore, action: .guide,
                     impact: "Models can be shared, private, fine-tuned, or needed offline. Their age does not establish that they are unused. Raw shared blobs are never bulk-deleted.",
                     recovery: "Use Ollama's model manager (ollama list / ollama rm <exact-model>), LM Studio's My Models, or the current hf cache tools. Confirm the original model is still downloadable first.")

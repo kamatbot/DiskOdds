@@ -77,7 +77,7 @@ actor CleanupExecutor {
         case .deleteSimulator:
             guard let id = item.simulatorID, UUID(uuidString: id) != nil,
                   item.kind == .unavailableSimulator,
-                  item.path == context.home.appendingPathComponent("Library/Developer/CoreSimulator/Devices/\(id)").path else {
+                  item.path == context.home.cleanupChild("Library/Developer/CoreSimulator/Devices/\(id)").path else {
                 throw CleanupFailure.rejected("Simulator target is outside the default device set.")
             }
             let output = try commands.run("/usr/bin/xcrun", ["simctl", "list", "devices", "--json"])

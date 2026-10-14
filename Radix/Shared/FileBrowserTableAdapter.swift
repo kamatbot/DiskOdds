@@ -21,12 +21,18 @@ struct FileBrowserTableAdapter: NSViewRepresentable {
     }
 
     func updateNSView(_ view: AttachmentView, context: Context) {
-        context.coordinator.nodes = nodes
-        context.coordinator.contentContext = contentContext
-        context.coordinator.controller = controller
-        context.coordinator.onDragActiveChange = onDragActiveChange
+        let coordinator = context.coordinator
+        coordinator.nodes = nodes
+        coordinator.controller = controller
+        coordinator.onDragActiveChange = onDragActiveChange
+        let contentContext = contentContext
         // SwiftUI may replace its data source when it updates table contents.
-        DispatchQueue.main.async { view.attach?() }
+        // Swap the content context on this hop so a bounds change cannot cache
+        // the previous row heights and then skip the refresh below.
+        DispatchQueue.main.async { [weak coordinator] in
+            coordinator?.contentContext = contentContext
+            view.attach?()
+        }
     }
 
     static func dismantleNSView(_ view: AttachmentView, coordinator: Coordinator) {
@@ -45,8 +51,15 @@ struct FileBrowserTableAdapter: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSTableViewDataSource, NSOutlineViewDataSource {
         var nodes: [FileNodeRecord] = []
-        var contentContext = FileBrowserDisplayContext.empty
-        private var laidOutContentContext: FileBrowserDisplayContext?
+        var contentContext = FileBrowserDisplayContext.empty {
+            didSet {
+                // Invalidated indexes belong to the previous contents.
+                if contentContext != oldValue { refreshedRows.removeAll() }
+            }
+        }
+        private var refreshedRows = IndexSet()
+        private var isNotingRowHeights = false
+        private var clipBoundsObserver: NSObjectProtocol?
         var controller: FileDragController?
         var onDragActiveChange: (Bool) -> Void = { _ in }
         private weak var table: NSTableView?
@@ -63,6 +76,7 @@ struct FileBrowserTableAdapter: NSViewRepresentable {
                         original = candidate.dataSource
                         candidate.dataSource = self
                     }
+                    observeEnclosingClipView(of: candidate)
                     refreshRowHeights(in: candidate)
                     return
                 }
@@ -70,18 +84,42 @@ struct FileBrowserTableAdapter: NSViewRepresentable {
             }
         }
 
+        private func observeEnclosingClipView(of table: NSTableView) {
+            guard clipBoundsObserver == nil, let clipView = table.enclosingScrollView?.contentView else { return }
+            clipView.postsBoundsChangedNotifications = true
+            clipBoundsObserver = NotificationCenter.default.addObserver(
+                forName: NSView.boundsDidChangeNotification,
+                object: clipView,
+                queue: nil
+            ) { [weak self] _ in
+                // Posted on the main thread, but the callback is not MainActor-isolated.
+                MainActor.assumeIsolated {
+                    guard let self, let table = self.table else { return }
+                    self.refreshRowHeights(in: table)
+                }
+            }
+        }
+
         private func refreshRowHeights(in table: NSTableView) {
-            guard laidOutContentContext != contentContext else { return }
+            // noteHeightOfRows can resize the clip view and post boundsDidChange.
+            guard !isNotingRowHeights else { return }
             let visibleRows = table.rows(in: table.visibleRect)
+            // Nothing visible yet. Leave the set untouched so a later attach retries.
             guard visibleRows.location != NSNotFound, visibleRows.length > 0 else { return }
             let end = min(NSMaxRange(visibleRows), table.numberOfRows)
             guard visibleRows.location < end else { return }
-            laidOutContentContext = contentContext
+            let visibleRange = visibleRows.location..<end
+            guard !refreshedRows.contains(integersIn: visibleRange) else { return }
+            let pending = IndexSet(integersIn: visibleRange).subtracting(refreshedRows)
+            guard !pending.isEmpty else { return }
+            refreshedRows.formUnion(pending)
+            isNotingRowHeights = true
+            defer { isNotingRowHeights = false }
             // A rescan can add a subtitle without changing the row's identity.
             // Invalidate after SwiftUI has updated the displayed cell contents.
             NSAnimationContext.runAnimationGroup { context in
                 context.duration = 0
-                table.noteHeightOfRows(withIndexesChanged: IndexSet(integersIn: visibleRows.location..<end))
+                table.noteHeightOfRows(withIndexesChanged: pending)
             }
         }
 
@@ -96,10 +134,14 @@ struct FileBrowserTableAdapter: NSViewRepresentable {
         }
 
         func detach() {
+            if let clipBoundsObserver {
+                NotificationCenter.default.removeObserver(clipBoundsObserver)
+                self.clipBoundsObserver = nil
+            }
             if let table, table.dataSource === self { table.dataSource = original }
             table = nil
             original = nil
-            laidOutContentContext = nil
+            refreshedRows.removeAll()
         }
 
         // NSTableView uses Objective-C optional-method discovery. Forward every

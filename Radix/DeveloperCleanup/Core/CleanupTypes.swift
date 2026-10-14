@@ -151,10 +151,10 @@ nonisolated enum CleanupPolicy {
     static func allowsTrash(_ item: CleanupItem, context: CleanupContext) -> Bool {
         guard item.action == .trash, item.actionable else { return false }
         let home = context.home.path
-        let derived = context.home.appendingPathComponent("Library/Developer/Xcode/DerivedData").path
+        let derived = context.home.cleanupChild("Library/Developer/Xcode/DerivedData").path
         switch item.kind {
         case .packageCache:
-            return cachePaths.contains { context.home.appendingPathComponent($0).path == item.path }
+            return cachePaths.contains { context.home.cleanupChild($0).path == item.path }
         case .xcodeCache:
             return xcodeCaches.contains { derived + "/" + $0 == item.path }
         case .derivedBuild:
@@ -178,5 +178,13 @@ nonisolated enum CleanupPolicy {
             }
         }
         return selected.sorted { $0.snapshot.allocatedBytes > $1.snapshot.allocatedBytes }
+    }
+}
+
+extension URL {
+    /// Appends a relative path without statting the disk or encoding separators.
+    /// `appendingPathComponent` stats to decide on a trailing slash and is the wrong call for multi-component paths.
+    func cleanupChild(_ relative: String) -> URL {
+        appending(path: relative, directoryHint: .notDirectory)
     }
 }
