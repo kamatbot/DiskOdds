@@ -80,6 +80,7 @@ nonisolated enum FileActionError: LocalizedError, Sendable {
     case folderRequiredForDrop
     case fullDiskAccessSettingsUnavailable
     case readOnlySnapshot
+    case readOnlyMode
     case currentComparisonSnapshotUnavailable
 
     var alertTitle: String? {
@@ -118,6 +119,8 @@ nonisolated enum FileActionError: LocalizedError, Sendable {
             return String(localized: "Radix could not open Full Disk Access settings.", comment: "Error shown when System Settings cannot open Full Disk Access.")
         case .readOnlySnapshot:
             return String(localized: "Imported snapshots are read-only.", comment: "Error shown when a file action is attempted on an imported snapshot.")
+        case .readOnlyMode:
+            return String(localized: "Read-only mode is enabled. Turn it off in Settings to use file cleanup actions.", comment: "Error when file cleanup is attempted while read-only mode is enabled.")
         case .currentComparisonSnapshotUnavailable:
             return String(localized: "Current scan changed. Start the comparison again.", comment: "Error shown when the live scan changed during comparison setup.")
         }
@@ -199,6 +202,18 @@ final class AppModel: ObservableObject {
 
     var workspaceTourSessionID: UUID? { tourSession.sessionID }
 
+    var isReadOnlyMode: Bool { trashFlow.isReadOnlyMode }
+    var canChangeReadOnlyMode: Bool {
+        !trashFlow.isMovingFiles && !workspaceTour.isActive && !fileDragController.isDragging
+    }
+
+    func setReadOnlyMode(_ isEnabled: Bool) {
+        guard canChangeReadOnlyMode, isEnabled != isReadOnlyMode,
+              trashFlow.setReadOnlyMode(isEnabled) else { return }
+        if isEnabled { cancelDeferredDiscardPileAdd() }
+        dependencies.preferences.saveReadOnlyMode(isEnabled)
+    }
+
     func makeFileBrowserModel() -> FileBrowserModel {
         let model = tourSession.makeFileBrowser(snapshotID: scanCoordinator.snapshot?.id)
         quickLookController.fileBrowser = model
@@ -232,7 +247,7 @@ final class AppModel: ObservableObject {
 
     private(set) var discardPile: DiscardPileState {
         get { trashFlow.discardPile }
-        set { trashFlow.discardPile = newValue }
+        set { trashFlow.replaceDiscardPile(newValue) }
     }
 
     private var optimisticTrashVisibility: TrashFlowController.OptimisticTrashVisibilityState {
@@ -249,6 +264,36 @@ final class AppModel: ObservableObject {
     private let quickLookController: AppQuickLookController
     private let archiveWorkflow: ArchiveWorkflowCoordinator
     private let navigationModel = WorkspaceNavigationModel()
+
+    lazy var fileDragController = FileDragController(
+        context: { [weak self] in
+            guard let self, !scanCoordinator.isScanOperationInProgress,
+                  scanCoordinator.expandingNodeID == nil,
+                  !isArchiveOperationInProgress, !trashFlow.isMovingFiles,
+                  let snapshot = scanCoordinator.snapshot else { return nil }
+            return FileDragController.Context(
+                snapshot: snapshot, target: scanCoordinator.selectedTarget,
+                trashSafetyPolicy: scanCoordinator.trashSafetyPolicy,
+                isReadOnlyMode: isReadOnlyMode
+            )
+        },
+        verifyIdentity: { [weak self] node in
+            self?.dependencies.systemActions.verifyTrashIdentity(node) ?? .missingCurrentItem
+        },
+        refresh: { [weak self] transfer in
+            self?.fileTransferReconciliation.fileTransferDidEnd(transfer)
+        }
+    )
+
+    private lazy var fileTransferReconciliation = FileTransferReconciliationCoordinator(
+        scanCoordinator: scanCoordinator,
+        cache: sidebarScanCacheController,
+        canStart: { [weak self] in
+            guard let self else { return false }
+            return !isArchiveOperationInProgress && !trashFlow.isMovingFiles
+        }
+    )
+
     private var lastActionErrorTitle: String?
     private let sidebarScanCacheController: SidebarScanCacheController
     private var lastPersistedScanPreferences: AppScanPreferences?
@@ -276,15 +321,19 @@ final class AppModel: ObservableObject {
     }
 
     private var deferredWorkBoxes: [DeferredWorkKind: DeferredWorkBox] = [:]
+    // Snapshot handles before cancellation so callers can await retired work.
+    var deferredViewUpdateTasks: [Task<Void, Never>] {
+        deferredWorkBoxes.values.compactMap(\.task)
+    }
     private var deferredNavigationContextSnapshotID: UUID?
-    private var exportPanelTask: Task<Void, Never>?
+    private(set) var exportPanelTask: Task<Void, Never>?
     private var exportPanelRequestID: UUID?
-    private var comparisonPanelTask: Task<Void, Never>?
+    private(set) var comparisonPanelTask: Task<Void, Never>?
     private var comparisonPanelRequestID: UUID?
     private var readyDeferredArchiveImportURL: URL?
     private var exportConfirmationDismissTask: Task<Void, Never>?
     private var fullDiskAccessRefreshTask: Task<Void, Never>?
-    private var targetCapacityDescriptionsRefreshTask: Task<Void, Never>?
+    private(set) var targetCapacityDescriptionsRefreshTask: Task<Void, Never>?
     private var diskFreeSpaceCapacityRefreshTask: Task<Void, Never>?
     private var diskFreeSpaceCapacityRefreshGeneration = 0
 
@@ -324,6 +373,7 @@ final class AppModel: ObservableObject {
         usageStats = dependencies.usageStats.loadUsageStats()
         fullDiskAccessStatus = .unknown
         recentTargets = dependencies.recentTargets.loadAvailableTargets()
+        trashFlow.setReadOnlyMode(preferences.isReadOnlyMode)
 
         // Read the previous launch history above before advancing it. A future
         // What's New flow can use that history to distinguish upgrades from first launches.
@@ -347,12 +397,21 @@ final class AppModel: ObservableObject {
             .store(in: &cancellables)
         archiveWorkflow.onBecameIdle = { [weak self] in
             self?.resumeReadyDeferredArchiveImportIfPossible()
+            self?.fileTransferReconciliation.resumeIfPossible()
         }
         trashFlow.onChange = { [weak self] in
             guard let self else { return }
             self.synchronizeTrashConfirmationPresentation()
             self.synchronizeCloudFileConfirmationPresentation()
             self.objectWillChange.send()
+            self.fileTransferReconciliation.resumeIfPossible()
+        }
+        trashFlow.onDiscardPileHistoryReplay = { [weak self] state in
+            guard let self, let fileTreeStore = self.scanCoordinator.fileTreeStore else { return }
+            self.reconcileNavigationForHiddenNodes(
+                hiddenNodeIDs: Set(state.nodeIDs),
+                fileTreeStore: fileTreeStore
+            )
         }
         comparisonFlow.onChange = { [weak self] in
             guard let self else { return }
@@ -382,6 +441,7 @@ final class AppModel: ObservableObject {
     }
 
     func cleanup() {
+        fileTransferReconciliation.cleanup()
         workspaceTour.stop()
         finishWorkspaceTour()
         flushPendingScanPreferences()
@@ -418,6 +478,7 @@ final class AppModel: ObservableObject {
     }
 
     func suspendMainWindowActivity() {
+        fileTransferReconciliation.suspend()
         workspaceTour.stop()
         cancelDeferredScanStart()
         cancelDeferredSidebarSelection()
@@ -434,6 +495,11 @@ final class AppModel: ObservableObject {
             scanCoordinator.stopScan(resetState: false)
         }
         quickLookController.closePreview()
+    }
+
+    func handleApplicationBecameActive() {
+        refreshFullDiskAccessStatus()
+        fileTransferReconciliation.applicationBecameActive()
     }
 
     func suspendBackgroundActivity() {
@@ -565,7 +631,7 @@ final class AppModel: ObservableObject {
     }
 
     var canStartWorkspaceTour: Bool {
-        !workspaceTour.isActive && canUseWorkspaceCommands
+        !isReadOnlyMode && !workspaceTour.isActive && canUseWorkspaceCommands
             && !scanCoordinator.isScanOperationInProgress && scanCoordinator.expandingNodeID == nil
             && !isArchiveOperationInProgress && !isExportPanelPresented
             && !trashFlow.isMovingFiles
@@ -725,6 +791,7 @@ final class AppModel: ObservableObject {
     }
 
     func restoreDefaultPreferences() {
+        setReadOnlyMode(AppPreferences.defaults.isReadOnlyMode)
         showHiddenFiles = AppScanPreferences.defaults.showHiddenFiles
         treatPackagesAsDirectories = AppScanPreferences.defaults.treatPackagesAsDirectories
         maxRenderedDepth = AppScanPreferences.defaults.maxRenderedDepth
@@ -1934,7 +2001,12 @@ final class AppModel: ObservableObject {
         }
         sidebarScanCacheController.cancelPendingSidebarTargetRestore()
         sidebarModel.setActiveTargetID(target.id)
-        guard applyCachedOrContainedSidebarTarget(target) else { return }
+        guard applyCachedOrContainedSidebarTarget(target) else {
+            if scanCoordinator.selectedTarget?.id == target.id {
+                fileTransferReconciliation.displayedSnapshotDidChange()
+            }
+            return
+        }
         startScan(target)
     }
 
@@ -2163,6 +2235,7 @@ final class AppModel: ObservableObject {
         _ nodeIDs: [FileNodeRecord.ID],
         snapshotID: UUID
     ) -> Bool {
+        fileDragController.markInternalDrop()
         guard scanCoordinator.snapshot?.id == snapshotID else {
             presentError(FileActionError.unsupported)
             return false
@@ -2227,6 +2300,38 @@ final class AppModel: ObservableObject {
         ) { model in
             model.addNodesToDiscardPile(nodes)
         }
+    }
+
+    var discardPileUndoManager: UndoManager { trashFlow.discardPileUndoManager }
+
+    private var canReplayDiscardPileChange: Bool {
+        !isReadOnlyMode && scanCoordinator.snapshot?.isComplete == true &&
+            scanCoordinator.snapshotSource.allowsFileMutation &&
+            !scanCoordinator.isScanOperationInProgress && scanCoordinator.expandingNodeID == nil &&
+            !isArchiveOperationInProgress && !trashFlow.isMovingFiles &&
+            pendingTrashSelection == nil && pendingCloudFileAction == nil &&
+            canUseWorkspaceCommands
+    }
+
+    var canUndoDiscardPileChange: Bool {
+        canReplayDiscardPileChange && discardPileUndoManager.canUndo
+    }
+
+    var canRedoDiscardPileChange: Bool {
+        canReplayDiscardPileChange && discardPileUndoManager.canRedo
+    }
+
+    var discardPileUndoTitle: String { discardPileUndoManager.undoMenuItemTitle }
+    var discardPileRedoTitle: String { discardPileUndoManager.redoMenuItemTitle }
+
+    func undoDiscardPileChange() {
+        guard canUndoDiscardPileChange else { return }
+        discardPileUndoManager.undo()
+    }
+
+    func redoDiscardPileChange() {
+        guard canRedoDiscardPileChange else { return }
+        discardPileUndoManager.redo()
     }
 
     func removeDiscardPileNode(id nodeID: FileNodeRecord.ID) {
@@ -2303,6 +2408,7 @@ final class AppModel: ObservableObject {
     }
 
     private func commitDiscardPileAddition(_ nodes: [FileNodeRecord]) throws {
+        try validateSnapshotAllowsMutation()
         guard let snapshot = scanCoordinator.snapshot,
               let fileTreeStore = scanCoordinator.fileTreeStore else {
             throw FileActionError.unsupported
@@ -2391,6 +2497,9 @@ final class AppModel: ObservableObject {
         wasCancelled: Bool = false
     ) {
         if !movedNodes.isEmpty {
+            if scanCoordinator.snapshot?.id == originalSnapshotID {
+                trashFlow.invalidateDiscardPileHistory()
+            }
             if discardPile.snapshotID == originalSnapshotID {
                 removeMovedNodesFromDiscardPile(movedNodes, fileTreeStore: statsFileTreeStore)
             }
@@ -2656,6 +2765,7 @@ final class AppModel: ObservableObject {
     }
 
     private func validateSnapshotAllowsMutation() throws {
+        guard !isReadOnlyMode else { throw FileActionError.readOnlyMode }
         guard scanCoordinator.snapshotSource.allowsFileMutation else {
             throw FileActionError.readOnlySnapshot
         }
@@ -2719,7 +2829,10 @@ final class AppModel: ObservableObject {
             fileTreeStore: fileTreeStore,
             preservingSelection: navigationModel.selectedNodeIDs.count == 1
         )
-        discardPile = DiscardPileState(nodeIDs: deduplicatedIDs, snapshotID: snapshot.id)
+        trashFlow.changeDiscardPile(
+            DiscardPileState(nodeIDs: deduplicatedIDs, snapshotID: snapshot.id),
+            actionName: String(localized: "Add to Discard Pile", comment: "Action for marking one selected item for possible deletion.")
+        )
     }
 
     private func deduplicatedDiscardPileIDs(
@@ -2799,6 +2912,10 @@ final class AppModel: ObservableObject {
     }
 
     private func syncDiscardPile(with snapshot: ScanSnapshot?) {
+        trashFlow.synchronizeDiscardPileContext(
+            snapshotID: snapshot?.id,
+            treeContentID: snapshot?.treeStore.contentID
+        )
         guard !discardPile.isEmpty else { return }
         guard let snapshot else {
             discardPile = DiscardPileState()
@@ -2985,6 +3102,9 @@ final class AppModel: ObservableObject {
             }
             .store(in: &cancellables)
 
+        scanCoordinator.onBecameIdle = { [weak self] in
+            self?.fileTransferReconciliation.resumeIfPossible()
+        }
         scanCoordinator.onScanFinished = { [weak self] snapshot in
             self?.recordCompletedScan(snapshot)
         }
@@ -2996,6 +3116,7 @@ final class AppModel: ObservableObject {
                 refreshDiskFreeSpaceCapacity(for: snapshot)
                 syncOptimisticTrashVisibility(with: snapshot)
                 syncDiscardPile(with: snapshot)
+                fileTransferReconciliation.displayedSnapshotDidChange()
                 if let snapshotID = snapshot?.id,
                    snapshotID == deferredNavigationContextSnapshotID {
                     return

@@ -9,8 +9,6 @@ import AppKit
 import SwiftUI
 
 struct ContentView: View {
-    private static let discardPileDragActivationDistance: CGFloat = 10
-
     @EnvironmentObject private var appModel: AppModel
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.scenePhase) private var scenePhase
@@ -21,6 +19,7 @@ struct ContentView: View {
     @State private var inspectorPreferenceBeforeTour: Bool?
     @State private var sidebarVisibilityBeforeTour: NavigationSplitViewVisibility?
     @State private var discardPileDragIsActive = false
+    @State private var isDiscardPileUndoContext = false
     @State private var discardPileDragMonitorTask: Task<Void, Never>?
     @StateObject private var tourPresentation = WorkspaceTourPresentation()
     @FocusState private var focusedWorkspaceTarget: WorkspaceFocusTarget?
@@ -71,6 +70,12 @@ struct ContentView: View {
         }
         .navigationSplitViewStyle(.balanced)
         .focusedSceneValue(\.isWorkspaceWindowFocused, true)
+        .focusedSceneValue(\.isDiscardPileUndoContext, isDiscardPileUndoContext)
+        .background {
+            DiscardPileUndoFocusObserver(includesAttachedSheet: appModel.presentationCoordinator.activeSheet == .discardPileReview) {
+                isDiscardPileUndoContext = $0
+            }
+        }
         .background {
             WorkspaceTourHost(
                 tour: appModel.workspaceTour,
@@ -306,6 +311,9 @@ struct ContentView: View {
         } message: {
             Text(cloudFileConfirmationMessage)
         }
+        .onAppear {
+            if scenePhase == .active { appModel.handleApplicationBecameActive() }
+        }
         .onDisappear {
             discardPileDragDidEnd()
             appModel.suspendMainWindowActivity()
@@ -317,7 +325,7 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {
             case .active:
-                appModel.refreshFullDiskAccessStatus()
+                appModel.handleApplicationBecameActive()
             case .background:
                 discardPileDragDidEnd()
                 appModel.suspendBackgroundActivity()
@@ -327,6 +335,7 @@ struct ContentView: View {
                 break
             }
         }
+        .environment(\.isReadOnlyMode, appModel.isReadOnlyMode)
     }
 }
 
@@ -601,37 +610,6 @@ private extension ContentView {
         }
     }
 
-    private func setDiscardPileDragIsActiveAfterThreshold(_ isActive: Bool) {
-        guard isActive else {
-            discardPileDragDidEnd()
-            return
-        }
-
-        guard discardPileDragMonitorTask == nil else { return }
-
-        let initialMouseLocation = NSEvent.mouseLocation
-        discardPileDragMonitorTask = Task { @MainActor in
-            while !Task.isCancelled {
-                guard NSEvent.pressedMouseButtons & 1 != 0 else {
-                    discardPileDragDidEnd()
-                    return
-                }
-
-                if Self.mouseLocation(
-                    NSEvent.mouseLocation,
-                    isAtLeast: Self.discardPileDragActivationDistance,
-                    from: initialMouseLocation
-                ) {
-                    discardPileDragIsActive = true
-                    await monitorDiscardPileDragUntilMouseUp()
-                    return
-                }
-
-                try? await Task.sleep(for: .milliseconds(16))
-            }
-        }
-    }
-
     private func monitorDiscardPileDragUntilMouseUp() async {
         try? await Task.sleep(for: .milliseconds(120))
 
@@ -643,12 +621,6 @@ private extension ContentView {
 
             try? await Task.sleep(for: .milliseconds(80))
         }
-    }
-
-    private static func mouseLocation(_ location: NSPoint, isAtLeast distance: CGFloat, from origin: NSPoint) -> Bool {
-        let dx = location.x - origin.x
-        let dy = location.y - origin.y
-        return ((dx * dx) + (dy * dy)) >= (distance * distance)
     }
 }
 
@@ -764,6 +736,7 @@ private extension ContentView {
 
     var workspaceActions: WorkspaceActions {
         WorkspaceActions(
+            fileDragController: appModel.fileDragController,
             makeFileBrowserModel: { appModel.makeFileBrowserModel() },
             quickLook: { appModel.handleQuickLookShortcut() },
             chooseFolder: { appModel.presentOpenPanelAndScan() },
@@ -790,8 +763,7 @@ private extension ContentView {
             selectedFileActions: previewSelectedFileActions,
             bulkFileActions: bulkFileActions,
             openFullDiskAccessSettings: { appModel.prepareAndOpenFullDiskAccessSettings() },
-            setDiscardPileDragActive: setDiscardPileDragIsActive,
-            setDiscardPileDragActiveAfterThreshold: setDiscardPileDragIsActiveAfterThreshold
+            setDiscardPileDragActive: setDiscardPileDragIsActive
         )
     }
 

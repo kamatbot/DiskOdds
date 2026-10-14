@@ -22,6 +22,7 @@ struct TreemapChartView: View {
     let onSelect: (String?) -> Void
     let onQuickLook: () -> Bool
     let onZoom: (String) -> Void
+    let fileDragController: FileDragController
     let onDiscardPileDragActiveChange: (Bool) -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -46,6 +47,7 @@ struct TreemapChartView: View {
         onSelect: @escaping (String?) -> Void,
         onQuickLook: @escaping () -> Bool,
         onZoom: @escaping (String) -> Void,
+        fileDragController: FileDragController,
         onDiscardPileDragActiveChange: @escaping (Bool) -> Void,
         chartModel: @autoclosure @escaping () -> TreemapChartModel = TreemapChartModel()
     ) {
@@ -64,6 +66,7 @@ struct TreemapChartView: View {
         self.onSelect = onSelect
         self.onQuickLook = onQuickLook
         self.onZoom = onZoom
+        self.fileDragController = fileDragController
         self.onDiscardPileDragActiveChange = onDiscardPileDragActiveChange
         _chartModel = StateObject(wrappedValue: chartModel())
     }
@@ -178,14 +181,14 @@ struct TreemapChartView: View {
                         )
                     },
                     canStartPan: { location in
-                        discardPileDragItem(
+                        fileDragSegment(
                             at: location,
                             in: baseChartFrame,
                             discardPileOverlay: discardPileOverlay
                         ) == nil
                     },
-                    discardPileDragItem: { location in
-                        discardPileDragItem(
+                    fileDragItem: { location in
+                        fileDragItem(
                             at: location,
                             in: baseChartFrame,
                             discardPileOverlay: discardPileOverlay
@@ -485,33 +488,28 @@ struct TreemapChartView: View {
         return chartModel.segment(at: chartPoint.point, in: chartPoint.size)
     }
 
-    private func discardPileDragItem(
+    private func fileDragSegment(
         at location: CGPoint,
         in frame: CGRect,
         discardPileOverlay: DiscardPileVisualizationOverlay
-    ) -> TreemapDiscardPileDragItem? {
+    ) -> TreemapSegment? {
         guard let segment = hitTest(at: location, in: frame),
               let nodeID = segment.nodeID,
               discardPileOverlay.allowsChartNodeAction(for: nodeID),
               !DiskMapFreeSpaceVisualization.isFreeSpaceNodeID(nodeID),
-              let node = treeStore.node(id: nodeID),
-              canDragToDiscardPile(node) else {
-            return nil
-        }
-
-        return TreemapDiscardPileDragItem(
-            payload: DiscardPileDragPayload(snapshotID: snapshotID, nodeIDs: [nodeID]),
-            segment: segment
-        )
+              fileDragController.canAttemptDrag(nodeID: nodeID) else { return nil }
+        return segment
     }
 
-    private func canDragToDiscardPile(_ node: FileNodeRecord) -> Bool {
-        FileNodeActionAvailability(
-            node: node,
-            activeTarget: activeTarget,
-            trashSafetyPolicy: trashSafetyPolicy,
-            snapshotSource: snapshotSource
-        ).canMoveToTrash
+    private func fileDragItem(
+        at location: CGPoint,
+        in frame: CGRect,
+        discardPileOverlay: DiscardPileVisualizationOverlay
+    ) -> TreemapFileDragItem? {
+        guard let segment = fileDragSegment(at: location, in: frame, discardPileOverlay: discardPileOverlay),
+              let nodeID = segment.nodeID,
+              let session = fileDragController.prepare(nodeIDs: [nodeID]) else { return nil }
+        return TreemapFileDragItem(session: session, segment: segment)
     }
 
     private func summaryStatus(for node: FileNodeRecord) -> String {

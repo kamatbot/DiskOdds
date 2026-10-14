@@ -60,15 +60,37 @@ final class TrashFlowController {
         didSet { notifyChanged() }
     }
 
-    @Published var discardPile: DiscardPileState {
+    @Published private(set) var discardPile: DiscardPileState {
         didSet { notifyChanged() }
     }
+
+    let discardPileUndoManager = UndoManager()
+    var onDiscardPileHistoryReplay: ((DiscardPileState) -> Void)?
+
+    private var discardPileHistorySnapshotID: UUID?
+    private var discardPileHistoryTreeContentID: UUID?
+    private var historyNotifications = Set<AnyCancellable>()
 
     private(set) var optimisticTrashVisibility = OptimisticTrashVisibilityState()
 
     private var confirmedTrashMoveTasks: [UUID: Task<Void, Never>] = [:]
     private var postTrashRemovalTask: Task<Void, Never>?
     private var postTrashRemovalRequests: [@MainActor () async -> Void] = []
+
+    private(set) var isReadOnlyMode = false
+
+    @discardableResult
+    func setReadOnlyMode(_ isEnabled: Bool) -> Bool {
+        guard isEnabled != isReadOnlyMode else { return true }
+        guard !isMovingFiles else { return false }
+        isReadOnlyMode = isEnabled
+        if isEnabled {
+            pendingTrashSelection = nil
+            pendingCloudFileAction = nil
+        }
+        notifyChanged()
+        return true
+    }
 
     var isMovingFiles: Bool { !confirmedTrashMoveTasks.isEmpty || postTrashRemovalTask != nil }
 
@@ -80,6 +102,19 @@ final class TrashFlowController {
         self.pendingTrashSelection = pendingTrashSelection
         self.pendingCloudFileAction = pendingCloudFileAction
         self.discardPile = discardPile
+        discardPileHistorySnapshotID = discardPile.snapshotID
+        discardPileUndoManager.groupsByEvent = false
+        discardPileUndoManager.levelsOfUndo = 50
+        NotificationCenter.default.publisher(
+            for: .NSUndoManagerDidUndoChange,
+            object: discardPileUndoManager
+        )
+        .merge(with: NotificationCenter.default.publisher(
+            for: .NSUndoManagerDidRedoChange,
+            object: discardPileUndoManager
+        ))
+        .sink { [weak self] _ in self?.notifyChanged() }
+        .store(in: &historyNotifications)
     }
 
     isolated deinit {
@@ -127,6 +162,7 @@ final class TrashFlowController {
         fileTreeStore: FileTreeStore?,
         allowingHiddenNodes: Bool = false
     ) throws {
+        guard !isReadOnlyMode else { throw FileActionError.readOnlyMode }
         guard nodes.allSatisfy({ node in
             node.supportsMoveToTrash(
                 activeTarget: activeTarget,
@@ -143,19 +179,63 @@ final class TrashFlowController {
         )
     }
 
+    /// Context is independent of the pile, which loses its snapshot ID when empty.
+    func synchronizeDiscardPileContext(snapshotID: UUID?, treeContentID: UUID?) {
+        guard discardPileHistorySnapshotID != snapshotID ||
+                discardPileHistoryTreeContentID != treeContentID else { return }
+        discardPileHistorySnapshotID = snapshotID
+        discardPileHistoryTreeContentID = treeContentID
+        invalidateDiscardPileHistory()
+    }
+
+    func invalidateDiscardPileHistory() {
+        guard discardPileUndoManager.canUndo || discardPileUndoManager.canRedo else { return }
+        discardPileUndoManager.removeAllActions()
+        notifyChanged()
+    }
+
+    /// Reconciliation and filesystem changes replace state without becoming undoable.
+    func replaceDiscardPile(_ state: DiscardPileState) {
+        invalidateDiscardPileHistory()
+        guard state != discardPile else { return }
+        discardPile = state
+    }
+
+    /// One user edit stores the complete ordered state, including ancestor collapse.
+    func changeDiscardPile(_ state: DiscardPileState, actionName: String) {
+        guard state != discardPile else { return }
+        if discardPileHistorySnapshotID == nil {
+            discardPileHistorySnapshotID = state.snapshotID ?? discardPile.snapshotID
+        }
+        guard let snapshotID = discardPileHistorySnapshotID,
+              state.isEmpty || state.snapshotID == snapshotID else { return }
+        let previous = discardPile
+        let isReplaying = discardPileUndoManager.isUndoing || discardPileUndoManager.isRedoing
+        if !isReplaying { discardPileUndoManager.beginUndoGrouping() }
+        discardPileUndoManager.registerUndo(withTarget: self) { controller in
+            guard controller.discardPileHistorySnapshotID == snapshotID else { return }
+            controller.changeDiscardPile(previous, actionName: actionName)
+        }
+        discardPileUndoManager.setActionName(actionName)
+        if !isReplaying { discardPileUndoManager.endUndoGrouping() }
+        discardPile = state
+        if isReplaying { onDiscardPileHistoryReplay?(state) }
+    }
+
     func removeDiscardPileNodes(ids nodeIDs: Set<FileNodeRecord.ID>) {
         guard !nodeIDs.isEmpty else { return }
         let remainingIDs = discardPile.nodeIDs.filter { !nodeIDs.contains($0) }
-        guard remainingIDs.count != discardPile.nodeIDs.count else { return }
-        discardPile = DiscardPileState(
-            nodeIDs: remainingIDs,
-            snapshotID: discardPile.snapshotID
+        changeDiscardPile(
+            DiscardPileState(nodeIDs: remainingIDs, snapshotID: discardPile.snapshotID),
+            actionName: String(localized: "Remove from Discard Pile", comment: "Action for unmarking items that will no longer be included in the Discard Pile.")
         )
     }
 
     func clearDiscardPile() {
-        guard !discardPile.isEmpty else { return }
-        discardPile = DiscardPileState()
+        changeDiscardPile(
+            DiscardPileState(),
+            actionName: String(localized: "Clear Discard Pile", comment: "Undo action name for removing every mark from the Discard Pile.")
+        )
     }
 
     static func topLevelTrashNodes(
@@ -247,6 +327,10 @@ final class TrashFlowController {
         beginMove: () -> Void,
         onFinish: @escaping @MainActor (_ requested: [FileNodeRecord], _ moved: [FileNodeRecord], _ actionError: Error?, _ wasCancelled: Bool) -> Void
     ) {
+        guard !isReadOnlyMode else {
+            onFinish(nodes, [], FileActionError.readOnlyMode, false)
+            return
+        }
         let requestID = UUID()
         confirmedTrashMoveTasks[requestID] = Task { [weak self] in
             var movedNodes: [FileNodeRecord] = []
