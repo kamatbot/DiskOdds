@@ -23,6 +23,7 @@ struct SunburstChartView: View {
     let onZoom: (String) -> Void
     let onSegmentClick: () -> Void
     let onNavigateToParent: () -> Void
+    let fileDragController: FileDragController
     let onDiscardPileDragActiveChange: (Bool) -> Void
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -51,6 +52,7 @@ struct SunburstChartView: View {
         onZoom: @escaping (String) -> Void,
         onSegmentClick: @escaping () -> Void,
         onNavigateToParent: @escaping () -> Void,
+        fileDragController: FileDragController,
         onDiscardPileDragActiveChange: @escaping (Bool) -> Void,
         chartModel: @autoclosure @escaping () -> SunburstChartModel = SunburstChartModel()
     ) {
@@ -73,6 +75,7 @@ struct SunburstChartView: View {
         self.onZoom = onZoom
         self.onSegmentClick = onSegmentClick
         self.onNavigateToParent = onNavigateToParent
+        self.fileDragController = fileDragController
         self.onDiscardPileDragActiveChange = onDiscardPileDragActiveChange
         _chartModel = StateObject(wrappedValue: chartModel())
     }
@@ -254,8 +257,8 @@ struct SunburstChartView: View {
                     canStartPan: { location in
                         canStartPan(at: location, in: baseChartFrame)
                     },
-                    discardPileDragItem: { location in
-                        discardPileDragItem(
+                    fileDragItem: { location in
+                        fileDragItem(
                             at: location,
                             in: baseChartFrame,
                             discardPileOverlay: discardPileOverlay
@@ -512,36 +515,24 @@ struct SunburstChartView: View {
         !isCenterHit(at: location, in: frame) && hitTest(at: location, in: frame) == nil
     }
 
-    private func discardPileDragItem(
+    private func fileDragItem(
         at location: CGPoint,
         in frame: CGRect,
         discardPileOverlay: DiscardPileVisualizationOverlay
-    ) -> SunburstDiscardPileDragItem? {
+    ) -> SunburstFileDragItem? {
         guard let segment = hitTest(at: location, in: frame),
               let nodeID = segment.nodeID,
               discardPileOverlay.allowsChartNodeAction(for: nodeID),
               !DiskMapFreeSpaceVisualization.isFreeSpaceNodeID(nodeID),
               let node = treeStore.node(id: nodeID),
-              canDragToDiscardPile(node) else {
+              let session = fileDragController.prepare(nodeIDs: [node.id]) else {
             return nil
         }
 
-        return SunburstDiscardPileDragItem(
-            payload: DiscardPileDragPayload(
-                snapshotID: snapshotID,
-                nodeIDs: [nodeID]
-            ),
+        return SunburstFileDragItem(
+            session: session,
             segment: segment
         )
-    }
-
-    private func canDragToDiscardPile(_ node: FileNodeRecord) -> Bool {
-        FileNodeActionAvailability(
-            node: node,
-            activeTarget: activeTarget,
-            trashSafetyPolicy: trashSafetyPolicy,
-            snapshotSource: snapshotSource
-        ).canMoveToTrash
     }
 
     private func isCenterHit(

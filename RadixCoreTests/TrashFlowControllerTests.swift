@@ -6,6 +6,142 @@ import Testing
 @MainActor
 struct TrashFlowControllerTests {
     @Test
+    func testDiscardPileRemovalAndClearRestoreExactOrderedBatches() {
+        let snapshotID = UUID()
+        let original = DiscardPileState(nodeIDs: ["first", "second", "third"], snapshotID: snapshotID)
+        let controller = TrashFlowController(discardPile: original)
+        controller.removeDiscardPileNodes(ids: ["first", "third"])
+        #expect(controller.discardPile.nodeIDs == ["second"])
+        controller.discardPileUndoManager.undo()
+        #expect(controller.discardPile == original)
+        controller.discardPileUndoManager.redo()
+        #expect(controller.discardPile.nodeIDs == ["second"])
+        controller.clearDiscardPile()
+        #expect(controller.discardPile.isEmpty)
+        #expect(controller.discardPile.snapshotID == nil)
+        controller.discardPileUndoManager.undo()
+        #expect(controller.discardPile == DiscardPileState(nodeIDs: ["second"], snapshotID: snapshotID))
+        controller.discardPileUndoManager.redo()
+        #expect(controller.discardPile.isEmpty)
+    }
+
+    @Test
+    func testNoOpEditsKeepRedoAndNewEditReplacesIt() {
+        let snapshotID = UUID()
+        let controller = TrashFlowController()
+        controller.synchronizeDiscardPileContext(snapshotID: snapshotID, treeContentID: UUID())
+        let first = DiscardPileState(nodeIDs: ["first"], snapshotID: snapshotID)
+        controller.changeDiscardPile(first, actionName: "Add")
+        controller.changeDiscardPile(first, actionName: "Duplicate")
+        controller.removeDiscardPileNodes(ids: ["unknown"])
+        controller.discardPileUndoManager.undo()
+        #expect(controller.discardPile.isEmpty)
+        #expect(!(controller.discardPileUndoManager.canUndo))
+        #expect(controller.discardPileUndoManager.canRedo)
+        controller.clearDiscardPile()
+        controller.removeDiscardPileNodes(ids: [])
+        #expect(controller.discardPileUndoManager.canRedo)
+        controller.changeDiscardPile(
+            DiscardPileState(nodeIDs: ["second"], snapshotID: snapshotID), actionName: "Add"
+        )
+        #expect(!(controller.discardPileUndoManager.canRedo))
+        controller.discardPileUndoManager.undo()
+        #expect(controller.discardPile.isEmpty)
+    }
+
+    @Test
+    func testDiscardPileHistoryIsBoundedToFiftyUserEdits() {
+        let snapshotID = UUID()
+        let controller = TrashFlowController()
+        controller.synchronizeDiscardPileContext(snapshotID: snapshotID, treeContentID: UUID())
+        for count in 1...60 {
+            controller.changeDiscardPile(
+                DiscardPileState(nodeIDs: (1...count).map(String.init), snapshotID: snapshotID),
+                actionName: "Add"
+            )
+        }
+        var undoCount = 0
+        while controller.discardPileUndoManager.canUndo {
+            controller.discardPileUndoManager.undo()
+            undoCount += 1
+        }
+        #expect(undoCount == 50)
+        #expect(controller.discardPile.nodeIDs.count == 10)
+        for _ in 0..<50 { controller.discardPileUndoManager.redo() }
+        #expect(controller.discardPile.nodeIDs.count == 60)
+    }
+
+    @Test
+    func testProgrammaticAndEmptyPileContextReplacementsInvalidateHistory() {
+        let snapshotID = UUID()
+        let contentID = UUID()
+        let original = DiscardPileState(nodeIDs: ["first"], snapshotID: snapshotID)
+        let controller = TrashFlowController()
+        controller.synchronizeDiscardPileContext(snapshotID: snapshotID, treeContentID: contentID)
+        controller.changeDiscardPile(original, actionName: "Add")
+        controller.clearDiscardPile()
+        controller.synchronizeDiscardPileContext(snapshotID: snapshotID, treeContentID: contentID)
+        #expect(controller.discardPileUndoManager.canUndo)
+        controller.synchronizeDiscardPileContext(snapshotID: UUID(), treeContentID: UUID())
+        #expect(!(controller.discardPileUndoManager.canUndo))
+        #expect(!(controller.discardPileUndoManager.canRedo))
+        controller.synchronizeDiscardPileContext(snapshotID: snapshotID, treeContentID: contentID)
+        controller.changeDiscardPile(original, actionName: "Add")
+        controller.discardPileUndoManager.undo()
+        #expect(controller.discardPileUndoManager.canRedo)
+        controller.replaceDiscardPile(DiscardPileState())
+        #expect(!(controller.discardPileUndoManager.canRedo))
+    }
+
+    @Test
+    func testReadOnlyModeRejectsDirectTrashRequestsAndConfirmedMoves() throws {
+        let controller = TrashFlowController()
+        let node = makeTestFileNode(id: "/selection/file", name: "file")
+        #expect(controller.setReadOnlyMode(true))
+        #expect(throws: FileActionError.self) {
+            try controller.stageTrashRequest(for: [node], activeTarget: nil,
+                trashSafetyPolicy: .live(), fileTreeStore: nil)
+        }
+        #expect(controller.pendingTrashSelection == nil)
+        var didFinish = false
+        controller.startConfirmedMove([node], moveToTrash: { _ in
+            Issue.record("Read-only mode must prevent filesystem moves")
+            return .matches
+        }, beginMove: {
+            Issue.record("Rejected moves must not hide scan results")
+        }, onFinish: { _, moved, error, wasCancelled in
+            #expect(moved.isEmpty)
+            #expect(!wasCancelled)
+            if case .readOnlyMode? = error as? FileActionError {} else {
+                Issue.record("Expected the read-only mode error")
+            }
+            didFinish = true
+        })
+        #expect(didFinish)
+        #expect(!controller.isMovingFiles)
+    }
+
+    @Test
+    func testReadOnlyModeCannotChangeDuringTrashMove() async throws {
+        let controller = TrashFlowController()
+        let node = makeTestFileNode(id: "/selection/file", name: "file")
+        var continuation: CheckedContinuation<Void, Never>?
+        var didFinish = false
+        controller.startConfirmedMove([node], moveToTrash: { _ in
+            await withCheckedContinuation { continuation = $0 }
+            return .matches
+        }, beginMove: {}, onFinish: { _, _, _, _ in didFinish = true })
+        #expect(!controller.setReadOnlyMode(true))
+        try await waitUntil("move starts") { continuation != nil }
+        #expect(!controller.setReadOnlyMode(true))
+        #expect(!controller.isReadOnlyMode)
+        continuation?.resume()
+        try await waitUntil("move finishes") { didFinish }
+        #expect(controller.setReadOnlyMode(true))
+        #expect(controller.isReadOnlyMode)
+    }
+
+    @Test
     func testReleasingControllerCancelsEveryConfirmedBatch() async throws {
         var controller: TrashFlowController? = TrashFlowController()
         var continuations: [CheckedContinuation<Void, Never>] = []

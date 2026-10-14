@@ -7,6 +7,135 @@ import Testing
 
 @MainActor
 struct AppModelDependencyTests {
+    @Test
+    func testReadOnlyModePersistsAcrossLaunchesAndResetsWithSettings() {
+        let preferences = SpyAppPreferencesStore(preferences: .defaults)
+        let model = AppModel(dependencies: makeDependencies(preferences: preferences))
+        defer { model.cleanup() }
+        #expect(!model.isReadOnlyMode)
+        model.setReadOnlyMode(true)
+        #expect(model.isReadOnlyMode)
+        #expect(preferences.preferences.isReadOnlyMode)
+
+        let relaunched = AppModel(dependencies: makeDependencies(preferences: preferences))
+        defer { relaunched.cleanup() }
+        #expect(relaunched.isReadOnlyMode)
+        model.restoreDefaultPreferences()
+        #expect(!model.isReadOnlyMode)
+        #expect(!preferences.preferences.isReadOnlyMode)
+    }
+
+    @Test(arguments: [false, true])
+    func testReadOnlyModeSuspendsDiscardPileHistoryWithoutDiscardingIt(isRedo: Bool) {
+        let model = AppModel(dependencies: makeDependencies())
+        defer { model.cleanup() }
+        let file = installSelection(on: model)
+        #expect(model.addNodesToDiscardPile([file]))
+        if isRedo {
+            model.undoDiscardPileChange()
+        } else {
+            model.clearDiscardPile()
+        }
+        #expect(model.discardPile.isEmpty)
+        #expect(isRedo ? model.canRedoDiscardPileChange : model.canUndoDiscardPileChange)
+
+        model.setReadOnlyMode(true)
+        #expect(!model.canUndoDiscardPileChange)
+        #expect(!model.canRedoDiscardPileChange)
+        model.undoDiscardPileChange()
+        model.redoDiscardPileChange()
+        #expect(model.discardPile.isEmpty)
+        #expect(isRedo ? model.discardPileUndoManager.canRedo : model.discardPileUndoManager.canUndo)
+
+        model.setReadOnlyMode(false)
+        if isRedo {
+            #expect(model.canRedoDiscardPileChange)
+            model.redoDiscardPileChange()
+        } else {
+            #expect(model.canUndoDiscardPileChange)
+            model.undoDiscardPileChange()
+        }
+        #expect(model.discardPile.nodeIDs == [file.id])
+    }
+
+    @Test
+    func testReadOnlyModeBlocksCleanupPreservesPileAndAllowsBrowsing() {
+        let recorder = AppModelActionRecorder()
+        var actions = AppSystemActions.inert
+        actions.fileExists = { _ in true }
+        actions.moveToTrash = { node in
+            recorder.movedToTrashURLs.append(node.url)
+            return .matches
+        }
+        actions.open = { recorder.openedURLs.append($0) }
+        actions.reveal = { recorder.revealedURLs.append($0) }
+        actions.copyPath = { recorder.copiedPathURLs.append($0) }
+        let model = AppModel(dependencies: makeDependencies(systemActions: actions))
+        defer { model.cleanup() }
+        let file = makeTestFileNode(id: "/selection/file.txt", name: "file.txt")
+        let queued = makeTestFileNode(id: "/selection/queued.txt", name: "queued.txt")
+        let root = makeTestDirectoryNode(id: "/selection", name: "selection", children: [file, queued])
+        let snapshot = makeTestSnapshot(root: root,
+            store: FileTreeStore(root: root, childrenByID: [root.id: [file, queued]]))
+        model.scanState.replaceCurrentSnapshot(snapshot)
+        model.navigation.reconcileAfterSnapshotApplied(snapshot)
+        #expect(model.addNodesToDiscardPile([queued]))
+        model.navigation.select(nodeIDs: [file.id], primaryNodeID: file.id)
+        model.requestMoveSelectedToTrash()
+        #expect(model.pendingTrashSelection != nil)
+        model.trashFlow.pendingCloudFileAction = .init(
+            kind: .moveToTrash(allowsHiddenNodes: false), nodes: [file], cloudImpact: .storedInCloud)
+
+        model.setReadOnlyMode(true)
+        #expect(model.pendingTrashSelection == nil)
+        #expect(model.pendingCloudFileAction == nil)
+        #expect(model.presentationCoordinator.activeDialog == nil)
+        #expect(model.discardPile.nodeIDs == [queued.id])
+        #expect(!model.addNodesToDiscardPile([file]))
+        #expect(!model.addNodeIDsToDiscardPile([file.id], snapshotID: snapshot.id))
+        #expect(!model.requestMoveNodesToTrash([file]))
+        #expect(!model.requestMoveDiscardPileToTrash())
+        model.requestMoveSelectedToTrash()
+        model.requestMovePrimarySelectionToTrash()
+        #expect(model.pendingTrashSelection == nil)
+        // A stale confirmation must also fail at the actual trash workflow boundary.
+        model.pendingTrashSelection = .init(nodes: [file])
+        model.confirmMovePendingSelectionToTrash()
+        #expect(recorder.movedToTrashURLs.isEmpty)
+        #expect(model.discardPile.nodeIDs == [queued.id])
+        #expect(model.scanState.fileTreeStore?.node(id: file.id) != nil)
+
+        model.dismissErrorPresentation()
+        model.openSelected()
+        model.revealSelectedInFinder()
+        model.copySelectedPath()
+        #expect(recorder.openedURLs == [file.url])
+        #expect(recorder.revealedURLs == [file.url])
+        #expect(recorder.copiedPathURLs == [file.url])
+        model.setReadOnlyMode(false)
+        #expect(model.addNodesToDiscardPile([file]))
+    }
+
+    @Test
+    func testReadOnlyModeCannotChangeDuringAnActiveFileDrag() throws {
+        var actions = AppSystemActions.inert
+        actions.verifyTrashIdentity = { _ in .matches }
+        let model = AppModel(dependencies: makeDependencies(systemActions: actions))
+        defer { model.cleanup() }
+        let file = installSelection(on: model)
+        let session = try #require(model.fileDragController.prepare(nodeIDs: [file.id]))
+        session.begin()
+        #expect(!model.canChangeReadOnlyMode)
+        model.setReadOnlyMode(true)
+        #expect(!model.isReadOnlyMode)
+        session.end(operation: [])
+        #expect(model.canChangeReadOnlyMode)
+        model.setReadOnlyMode(true)
+        let readOnlySession = try #require(model.fileDragController.prepare(nodeIDs: [file.id]))
+        #expect(readOnlySession.operationMask(for: .outsideApplication) == .copy)
+        #expect(readOnlySession.operationMask(for: .withinApplication).isEmpty)
+    }
+
     @Test(arguments: [false, true])
     func testLaunchHistoryAdvancesOnlyForNewerVersions(didCompleteOnboarding: Bool) {
         let preferences = SpyAppPreferencesStore(
@@ -364,9 +493,11 @@ struct AppModelDependencyTests {
         let model = AppModel(dependencies: makeDependencies())
 
         model.setScanVisualizationModeAfterViewUpdate(.treemap)
+        let pendingTasks = model.deferredViewUpdateTasks
+        #expect(!pendingTasks.isEmpty)
         model.setScanVisualizationModeAfterViewUpdate(.sunburst)
 
-        try await Task.sleep(for: .milliseconds(40))
+        for task in pendingTasks { await task.value }
 
         #expect(model.scanVisualizationMode == .sunburst)
     }
@@ -1719,6 +1850,106 @@ struct AppModelDependencyTests {
     }
 
     @Test
+    func testDiscardPileUndoSurvivesReviewReopeningAndDoesNotTouchFiles() {
+        var actions = AppSystemActions.inert
+        actions.fileExists = { _ in
+            Issue.record("Replaying marks must not inspect the filesystem")
+            return false
+        }
+        actions.moveToTrash = { _ in
+            Issue.record("Replaying marks must not move files")
+            return .matches
+        }
+        let model = AppModel(dependencies: makeDependencies(systemActions: actions))
+        let file = installSelection(on: model)
+        #expect(model.addNodesToDiscardPile([file]))
+        model.presentDiscardPileReview()
+        model.removeDiscardPileNode(id: file.id)
+        model.dismissDiscardPileReview()
+        model.presentDiscardPileReview()
+        #expect(model.canUndoDiscardPileChange)
+        model.undoDiscardPileChange()
+        #expect(model.discardPile.nodeIDs == [file.id])
+        #expect(model.canRedoDiscardPileChange)
+        model.redoDiscardPileChange()
+        #expect(model.discardPile.isEmpty)
+    }
+
+    @Test
+    func testDiscardPileUndoRestoresChildrenAfterAncestorCollapseAndHidesSelection() {
+        let first = makeTestFileNode(id: "/selection/folder/first", name: "first")
+        let second = makeTestFileNode(id: "/selection/folder/second", name: "second")
+        let folder = makeTestDirectoryNode(id: "/selection/folder", name: "folder", children: [first, second])
+        let root = makeTestDirectoryNode(id: "/selection", name: "selection", children: [folder])
+        let snapshot = makeTestSnapshot(root: root, store: FileTreeStore(
+            root: root, childrenByID: [root.id: [folder], folder.id: [first, second]]
+        ))
+        let model = AppModel(dependencies: makeDependencies())
+        model.scanState.replaceCurrentSnapshot(snapshot)
+        model.navigation.reconcileAfterSnapshotApplied(snapshot)
+        #expect(model.addNodesToDiscardPile([second, first]))
+        #expect(model.addNodesToDiscardPile([folder]))
+        #expect(model.discardPile.nodeIDs == [folder.id])
+        model.undoDiscardPileChange()
+        #expect(model.discardPile.nodeIDs == [second.id, first.id])
+        model.clearDiscardPile()
+        model.navigation.setFocusedNodeID(folder.id)
+        model.navigation.select(nodeIDs: [first.id, second.id], primaryNodeID: first.id)
+        model.undoDiscardPileChange()
+        #expect(model.discardPile.nodeIDs == [second.id, first.id])
+        #expect(model.navigation.selectedNodeIDs.isEmpty)
+        model.redoDiscardPileChange()
+        #expect(model.discardPile.isEmpty)
+    }
+
+    @Test
+    func testEmptyDiscardPileHistoryClearsForNewScanAndChangedTree() throws {
+        let model = AppModel(dependencies: makeDependencies())
+        let file = installSelection(on: model)
+        #expect(model.addNodesToDiscardPile([file]))
+        model.clearDiscardPile()
+        #expect(model.canUndoDiscardPileChange)
+        let existing = try #require(model.scanState.snapshot)
+        let changed = try #require(existing.removingNode(id: file.id))
+        #expect(changed.id == existing.id)
+        model.scanState.replaceCurrentSnapshot(changed)
+        #expect(!(model.discardPileUndoManager.canUndo))
+        #expect(!(model.discardPileUndoManager.canRedo))
+        let replacement = installSelection(on: model)
+        #expect(model.addNodesToDiscardPile([replacement]))
+        model.clearDiscardPile()
+        #expect(model.canUndoDiscardPileChange)
+        installSelection(on: model)
+        #expect(!(model.discardPileUndoManager.canUndo))
+    }
+
+    @Test
+    func testConfirmedTrashInvalidatesHistoryEvenWhenDiscardPileIsEmpty() async throws {
+        var actions = AppSystemActions.inert
+        actions.fileExists = { _ in true }
+        actions.moveToTrash = { _ in .matches }
+        let model = AppModel(dependencies: makeDependencies(systemActions: actions))
+        let file = installSelection(on: model)
+        model.scanState.selectedTarget = model.scanState.snapshot?.target
+        #expect(model.addNodesToDiscardPile([file]))
+        model.clearDiscardPile()
+        #expect(model.canUndoDiscardPileChange)
+        #expect(model.requestMoveNodesToTrash([file]))
+        #expect(!(model.canUndoDiscardPileChange))
+        model.undoDiscardPileChange()
+        #expect(model.discardPile.isEmpty)
+        model.cancelPendingTrash()
+        #expect(model.canUndoDiscardPileChange)
+        #expect(model.requestMoveNodesToTrash([file]))
+        model.confirmMovePendingSelectionToTrash()
+        #expect(!(model.canUndoDiscardPileChange))
+        try await waitUntil("trash clears collection history") { model.usageStats.bytesMovedToTrash > 0 }
+        #expect(model.discardPile.isEmpty)
+        #expect(!(model.discardPileUndoManager.canUndo))
+        #expect(!(model.discardPileUndoManager.canRedo))
+    }
+
+    @Test
     func testPrimaryDiscardPileAddAfterViewUpdateDefersMutation() async throws {
         var actions = AppSystemActions.inert
         actions.fileExists = { _ in true }
@@ -2378,11 +2609,12 @@ struct AppModelDependencyTests {
         try await waitUntil("async capacity description refresh starts") {
             await probe.isWaiting
         }
+        let refreshTask = try #require(model.targetCapacityDescriptionsRefreshTask)
 
         model.cleanup()
         await probe.resume(returning: [loadedTarget.id: "1 GB free of 2 GB"])
 
-        try await Task.sleep(for: .milliseconds(40))
+        await refreshTask.value
 
         #expect(model.availableTargets == [loadedTarget])
         #expect(model.targetCapacityDescriptions.isEmpty)
@@ -2718,19 +2950,21 @@ struct AppModelDependencyTests {
         try await waitUntil("first export panel") {
             await firstPanel.isWaiting
         }
+        let firstPanelTask = try #require(model.exportPanelTask)
         model.cleanup()
         model.exportCurrentScan()
         try await waitUntil("second export panel") {
             await secondPanel.isWaiting
         }
+        let secondPanelTask = try #require(model.exportPanelTask)
 
         await firstPanel.resume(returning: staleURL)
-        try await Task.sleep(for: .milliseconds(20))
+        await firstPanelTask.value
         #expect(model.isExportPanelPresented)
 
         model.cleanup()
         await secondPanel.resume(returning: currentURL)
-        try await Task.sleep(for: .milliseconds(20))
+        await secondPanelTask.value
 
         #expect(!(model.isExportPanelPresented))
         let exportRequests = await archiveService.exportRequestsSnapshot()
@@ -3075,6 +3309,8 @@ struct AppModelDependencyTests {
             finishedAt: Date(timeIntervalSince1970: 40),
             sourceURL: newURL
         )
+        let imports = AsyncValueProbe<Void>()
+        defer { Task { await imports.resume(returning: ()) } }
         let archiveService = try SpyScanArchiveService(
             previewResultsByURL: [
                 oldURL: makeArchivePreview(archiveURL: oldURL, snapshot: oldSnapshot),
@@ -3084,7 +3320,7 @@ struct AppModelDependencyTests {
                 oldURL: makeArchiveImportResult(archiveURL: oldURL, snapshot: oldSnapshot),
                 newURL: makeArchiveImportResult(archiveURL: newURL, snapshot: newSnapshot),
             ],
-            importDelay: .milliseconds(25)
+            importWaitProbe: imports
         )
         var selectedSnapshotURLs = [oldURL, newURL]
         var actions = AppSystemActions.inert
@@ -3120,6 +3356,11 @@ struct AppModelDependencyTests {
         #expect(importedURLsBeforeConfirm.isEmpty)
 
         model.confirmComparisonSetup()
+
+        try await waitUntil("both comparison imports are suspended") {
+            await imports.waitingCount == 2
+        }
+        await imports.resume(returning: ())
 
         try await waitUntil("comparison built") {
             model.scanComparison?.summary.changedCount == 1
@@ -3234,6 +3475,7 @@ struct AppModelDependencyTests {
         try await waitUntil("first comparison panel") {
             await firstPanel.isWaiting
         }
+        let firstPanelTask = try #require(model.comparisonPanelTask)
         model.chooseComparisonSnapshot(for: .before)
         try await waitUntil("second comparison panel") {
             await secondPanel.isWaiting
@@ -3244,7 +3486,7 @@ struct AppModelDependencyTests {
             model.pendingComparisonSetup?.before?.displayName == newSnapshot.target.displayName
         }
         await firstPanel.resume(returning: oldURL)
-        try await Task.sleep(for: .milliseconds(20))
+        await firstPanelTask.value
 
         #expect(model.pendingComparisonSetup?.before?.displayName == newSnapshot.target.displayName)
         let previewedURLs = await archiveService.previewedURLsSnapshot()
@@ -3478,21 +3720,24 @@ struct AppModelDependencyTests {
 }
 
 private actor AsyncValueProbe<Value: Sendable> {
-    private var continuation: CheckedContinuation<Value, Never>?
+    private var continuations: [CheckedContinuation<Value, Never>] = []
+
+    var waitingCount: Int { continuations.count }
 
     var isWaiting: Bool {
-        continuation != nil
+        !continuations.isEmpty
     }
 
     func wait() async -> Value {
         await withCheckedContinuation { pendingContinuation in
-            continuation = pendingContinuation
+            continuations.append(pendingContinuation)
         }
     }
 
     func resume(returning value: Value) {
-        continuation?.resume(returning: value)
-        continuation = nil
+        let pending = continuations
+        continuations.removeAll()
+        for continuation in pending { continuation.resume(returning: value) }
     }
 }
 
@@ -3763,6 +4008,10 @@ private final class SpyAppPreferencesStore: AppPreferencesPersisting {
         savedScanPreferences.append(preferences)
     }
 
+    func saveReadOnlyMode(_ isEnabled: Bool) {
+        preferences.isReadOnlyMode = isEnabled
+    }
+
     func markOnboardingComplete() {
         preferences.didCompleteOnboarding = true
         markOnboardingCompleteCount += 1
@@ -3891,7 +4140,6 @@ private actor SpyScanArchiveService: ScanArchiveServicing {
     private let exportWaitProbe: AsyncValueProbe<Void>?
     private let previewWaitProbe: AsyncValueProbe<Void>?
     private let importWaitProbe: AsyncValueProbe<Void>?
-    private let importDelay: Duration?
     private var activeImportCount = 0
     private var maximumConcurrentImportCount = 0
     private(set) var exportCancellationStates: [Bool] = []
@@ -3905,8 +4153,7 @@ private actor SpyScanArchiveService: ScanArchiveServicing {
         importResultsByURL: [URL: ScanArchiveImportResult] = [:],
         exportWaitProbe: AsyncValueProbe<Void>? = nil,
         previewWaitProbe: AsyncValueProbe<Void>? = nil,
-        importWaitProbe: AsyncValueProbe<Void>? = nil,
-        importDelay: Duration? = nil
+        importWaitProbe: AsyncValueProbe<Void>? = nil
     ) {
         self.previewResult = previewResult
         self.previewResultsByURL = previewResultsByURL
@@ -3915,7 +4162,6 @@ private actor SpyScanArchiveService: ScanArchiveServicing {
         self.exportWaitProbe = exportWaitProbe
         self.previewWaitProbe = previewWaitProbe
         self.importWaitProbe = importWaitProbe
-        self.importDelay = importDelay
     }
 
     func export(
@@ -3959,9 +4205,6 @@ private actor SpyScanArchiveService: ScanArchiveServicing {
         activeImportCount += 1
         maximumConcurrentImportCount = max(maximumConcurrentImportCount, activeImportCount)
         defer { activeImportCount -= 1 }
-        if let importDelay {
-            try await Task.sleep(for: importDelay)
-        }
         if let importWaitProbe {
             await importWaitProbe.wait()
         }
